@@ -48,3 +48,6 @@ sinaee@pender:~$ tar xzvf i_87654321.tar.gz
 # Labs
 
 - See [Lab 1 instructions](docs/lab1.md)
+
+# Acknowledgements
+This course is based on the graduate course on Distributed Systems (6.584) developed by Robert Morris, Frans Kaashoek, and Nickolai Zeldovich at MIT, with permission from the content authors. Many aspects are also inspired by the graduate course on Distributed Systems taught by Peter Druschel and others at MPI-SWS.
