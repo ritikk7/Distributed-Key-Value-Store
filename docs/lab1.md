@@ -88,7 +88,7 @@ We supply you with a test script in `main/test-mr.sh`. The tests check that the 
 If you run the test script now, it will hang because the coordinator never finishes:
 
 ```bash
-$ cd ~/\[??folder\]/src/main
+$ cd ~/cpsc416-2023w2-golabs/src/main
 $ bash test-mr.sh
 \*\*\* Starting wc test.                
 ```        
@@ -137,6 +137,8 @@ You may see some errors from the Go RPC package that look like
 ```         
 
 Ignore these messages; registering the coordinator as an [RPC server](https://go.dev/src/net/rpc/server.go) checks if all its methods are suitable for RPCs (have 3 inputs); we know that `Done` is not called via RPC.
+
+Note: If you are using the department machine or SSH onto the remote servers for this lab, make sure to set your `TempFile` path to your home directory in your `worker.go`, otherwise your program would fail when renaming the temporary files. (You can use `echo ~` in your terminal to check the home directory)
 
 ### A few rules:
 
