@@ -138,8 +138,6 @@ You may see some errors from the Go RPC package that look like
 
 Ignore these messages; registering the coordinator as an [RPC server](https://go.dev/src/net/rpc/server.go) checks if all its methods are suitable for RPCs (have 3 inputs); we know that `Done` is not called via RPC.
 
-Note: If you are using the department machine or SSH onto the remote servers for this lab, make sure to set your `TempFile` path to your home directory in your `worker.go`, otherwise your program would fail when renaming the temporary files. (You can use `echo ~` in your terminal to check the home directory)
-
 ### A few rules:
 
 *   The map phase should divide the intermediate keys into buckets for `nReduce` reduce tasks, where `nReduce` is the number of reduce tasks -- the argument that `main/mrcoordinator.go` passes to `MakeCoordinator()`. Each mapper should create `nReduce` intermediate files for consumption by the reduce tasks.
