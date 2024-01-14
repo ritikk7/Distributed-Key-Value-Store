@@ -1,20 +1,22 @@
-# General Guidelines
+# General Guidelines for Each Lab
 
 1. Ensure that your code both **compiles** and **runs** on the undergraduate servers. Failure to compile successfully will result in a zero for the lab.
 
-2. All test cases carry equal weight in grading. If your program passes 3 out of 10 tests for a lab, you will receive 30% of the grade for that lab. Any runtime errors leading to test failures are considered as **not passed**.
-   - There may be an oral examination for each lab. In such cases, the lab grading will be split 50% between automated testing and 50% for the oral examination.
-   - We run each test multiple times, and failing any of them will fail that particular test.
+1. **Automated testing.** All test cases carry equal weight in grading. If your program passes 3 out of 10 tests for a lab, you will receive at most 30% of the grade for that lab. Any runtime errors leading to test failures are considered as **test not passed**.
+   - We will run each test multiple times, and failing any of them will fail that particular test. For instance, depending on the nature of a test, we may decide to run it for 100 times.
+   - While we plan to share all tests in advance, we may occassionally also run hidden tests. In this case, we will share the test used for evaluation afterwards.
 
-3. Stick to the provided Go built-in packages for coding; do not use external packages unless explicitly allowed. Using an external package for a lab will result in a zero for that lab.
+1. **Oral examination.** We may conduct an oral examination for each lab. For team submissions, we will evaluate both team members together. In each case, 50% of the grades will be derived from automated testing and 50% from the oral examination.
 
-4. Each lab provides a basic template to start your work. Ideally, make changes only to the files required. These are sufficient places where you can put your code to get full marks for the lab. However, you can organize your code by adding packages and files, but refrain from changing specified files and folder structures. These specified files and folders are replaced during grading, so organize your code in a way that doesn't depend on changes in them.
+1. Stick to the provided Go built-in packages for coding; do not use external packages unless explicitly allowed. Using an external package for a lab will result in a zero for that lab.
 
-5. If you need to make changes to files specified as unchangeable for debugging purposes, feel free to do so. However, ensure that your program ultimately compiles and runs with the original version provided.
+1. Each lab provides a basic template to start your work. Ideally, make changes only to the files required. There are sufficient places where you can put your code to get full marks for the lab. Please refrain from changing the specified test files and the directory structure. Our testing scripts will use pristine copies of the test files and will rely on the original directory structure.
+
+1. For debugging pursposes, you may need to make changes to files specified as unchangeable, e.g., you may decide to comment out or modify the testing functions to understand exactly where your code is failing. Feel free to make such changes. However, ensure that your program ultimately compiles and runs with the original versions of these files.
 
 # Submitting Your Code
 
-When submitting your code on Canvas:
+You will submit your solutions on **Canvas**. When submitting your code:
 
 - Use `make tar lab_name=LAB_NAME student_id=STUDENT_ID` to create a `.tar.gz` version for your lab. The `STUDENT_ID` should adhere to the naming pattern:
   - For lab 1: `i_[stu-number]`
@@ -39,7 +41,7 @@ sinaee@pender:~$ ls
 Makefile          README.md         i_87654321.tar.gz   src     docs
 ```
 
-Now, upload the `i_87654321.tar.gz` to Canvas. If we cannot untar your file, we cannot evaluate your lab. Therefore, ensure that the `tar` object is created successfully by simply downloading your submission and untarring it. Use the following command to untar your files.
+Now, upload the `i_87654321.tar.gz` on Canvas for the corresponding assignment. If we cannot untar your file, we cannot evaluate your lab. Therefore, ensure that the `tar` object is created successfully by simply downloading your submission and untarring it. Use the following command to untar your files.
 
 ```bash
 sinaee@pender:~$ tar xzvf i_87654321.tar.gz
@@ -50,4 +52,4 @@ sinaee@pender:~$ tar xzvf i_87654321.tar.gz
 - See [Lab 1 instructions](docs/lab1.md)
 
 # Acknowledgements
-This course is based on the graduate course on Distributed Systems (6.584) developed by Robert Morris, Frans Kaashoek, and Nickolai Zeldovich at MIT, with permission from the content authors. Many aspects are also inspired by the graduate course on Distributed Systems taught by Peter Druschel and others at MPI-SWS.
+The programming labs are based on the labs developed by Robert Morris, Frans Kaashoek, and Nickolai Zeldovich at MIT as part of their graduate course on Distributed Systems (6.584), and are reused with permission from the content authors.
