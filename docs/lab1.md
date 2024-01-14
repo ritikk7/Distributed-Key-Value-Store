@@ -1,7 +1,7 @@
 CPSC 416 Lab 1: MapReduce
 =========================
 
-### Due: Tuesday Jan 23 6pm (PST Time)
+### Due: Thursday Jan 25 6pm (PST Time)
 
 * * *
 
