@@ -7,6 +7,8 @@
 #	 $ make build-mrapp-wc
 # 4. To build the mr package
 #    $ make build-mr
+# 5. To make a tar for lab1 for student id "87654321"
+#	 $ make tar lab_name=lab1 student_id=i_87654321
 
 MRAPPS_SRC_DIR = src/mrapps
 MAIN_SRC_DIR = src/main
