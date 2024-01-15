@@ -35,7 +35,7 @@ sinaee@pender:~$ ls
 Makefile  README.md src docs
 
 sinaee@pender:~$ make tar lab_name=lab1 student_id=i_87654321
-# NOTE: this is the `make tar` command and not the `tar` command. See the `NOTICE` section below.
+# NOTE: this is the `make tar` command and not the `tar` command. See `NOTICE 1` below.
 # a lot of output; you should not see any errors.
 
 sinaee@pender:~$ ls
@@ -48,9 +48,9 @@ Now, upload the `i_87654321.tar.gz` on **Canvas** for the corresponding assignme
 sinaee@pender:~$ tar xzvf i_87654321.tar.gz
 ```
 
-**NOTICE 1:** We used the `make tar` command specified in the `Makefile`, which automatically excludes unnecessary files and folders, such as the `.git` folder. If you directly execute the `tar` command, it would include the entire Git history, which is something we aim to avoid.
+**NOTICE 1:** We use the `make tar` command defined in the `Makefile`, which automatically excludes unnecessary files and folders, such as the `.git` folder. If you execute the `tar` command directly, it would include the entire Git history, which is something we aim to avoid.
 
-**NOTICE 2:** Just to re-emphasize that you should test and run your code on one of the undergrad servers (in the above example, we used the `pender` machine).
+**NOTICE 2:** We would like to re-emphasize that you should test and run your code on one of the undergrad servers. For instance, in the above example, we used the `pender` machine.
 
 # Labs
 
