@@ -23,7 +23,7 @@ You will submit your solutions on **Canvas**. When submitting your code:
   - For lab 2-4: `g_[stu-number1]_[stu-number2]`
   - Submit the `tar` file on Canvas.
 
-   The following is an example of how to do it (assuming the repository is already cloned in the home directory and lab1 is completed):
+   The following is an example of how to do it on the `pender` machine (assuming the repository is already cloned in the home directory and lab1 is completed):
 
 ```bash
 sinaee@pender:~$ ls
@@ -35,17 +35,22 @@ sinaee@pender:~$ ls
 Makefile  README.md src docs
 
 sinaee@pender:~$ make tar lab_name=lab1 student_id=i_87654321
-# a lot of output; you should not see any errors
+# NOTE: this is the `make tar` command and not the `tar` command. See the `NOTICE` section below.
+# a lot of output; you should not see any errors.
 
 sinaee@pender:~$ ls
 Makefile          README.md         i_87654321.tar.gz   src     docs
 ```
 
-Now, upload the `i_87654321.tar.gz` on Canvas for the corresponding assignment. If we cannot untar your file, we cannot evaluate your lab. Therefore, ensure that the `tar` object is created successfully by simply downloading your submission and untarring it. Use the following command to untar your files.
+Now, upload the `i_87654321.tar.gz` on **Canvas** for the corresponding assignment. If we cannot untar your file, we cannot evaluate your lab. Therefore, ensure that the `tar` object is created successfully by simply downloading your submission and untarring it. Use the following command to untar your files.
 
 ```bash
 sinaee@pender:~$ tar xzvf i_87654321.tar.gz
 ```
+
+**NOTICE 1:** We used the `make tar` command specified in the `Makefile`, which automatically excludes unnecessary files and folders, such as the `.git` folder. If you directly execute the `tar` command, it would include the entire Git history, which is something we aim to avoid.
+
+**NOTICE 2:** Just to re-emphasize that you should test and run your code on one of the undergrad servers (in the above example, we used the `pender` machine).
 
 # Labs
 
