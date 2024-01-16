@@ -28,7 +28,7 @@ $ cd ~/cpsc416-2023w2-golabs/
 $ cd src/main
 $ go build -buildmode=plugin ../mrapps/wc.go
 $ rm mr-out\*
-$ go run mrsequential.go wc.so pg\*.txt
+$ go run mrsequential.go wc.so pg*.txt
 $ more mr-out-0
 A 509
 ABOUT 2
@@ -59,8 +59,8 @@ $ go build -buildmode=plugin ../mrapps/wc.go
 In the `main` directory, run the coordinator.
 
 ```bash
-$ rm mr-out\*
-$ go run mrcoordinator.go pg-\*.txt
+$ rm mr-out*
+$ go run mrcoordinator.go pg-*.txt
 ```
             
 
@@ -75,7 +75,7 @@ $ go run mrworker.go wc.so
 When the workers and coordinator have finished, look at the output in `mr-out-*`. When you've completed the lab, the sorted union of the output files should match the sequential output, like this:
 
 ```bash
-$ cat mr-out-\* | sort | more
+$ cat mr-out-* | sort | more
 A 509
 ABOUT 2
 ACT 8
@@ -90,14 +90,14 @@ If you run the test script now, it will hang because the coordinator never finis
 ```bash
 $ cd ~/cpsc416-2023w2-golabs/src/main
 $ bash test-mr.sh
-\*\*\* Starting wc test.                
+*** Starting wc test.             
 ```        
 
 You can change `ret := false` to true in the Done function in `mr/coordinator.go` so that the coordinator exits immediately. Then:
 
 ```bash
 $ bash test-mr.sh
-\*\*\* Starting wc test.
+*** Starting wc test.
 sort: No such file or directory
 cmp: EOF on mr-wc-all
 --- wc output is not the same as mr-correct-wc.txt
@@ -112,21 +112,21 @@ When you've finished, the test script output should look like this:
 
 ```bash
 $ bash test-mr.sh
-\*\*\* Starting wc test.
+*** Starting wc test.
 --- wc test: PASS
-\*\*\* Starting indexer test.
+*** Starting indexer test.
 --- indexer test: PASS
-\*\*\* Starting map parallelism test.
+*** Starting map parallelism test.
 --- map parallelism test: PASS
-\*\*\* Starting reduce parallelism test.
+*** Starting reduce parallelism test.
 --- reduce parallelism test: PASS
-\*\*\* Starting job count test.
+*** Starting job count test.
 --- job count test: PASS
-\*\*\* Starting early exit test.
+*** Starting early exit test.
 --- early exit test: PASS
-\*\*\* Starting crash test.
+*** Starting crash test.
 --- crash test: PASS
-\*\*\* PASSED ALL TESTS
+*** PASSED ALL TESTS
 $         
 ```
 
@@ -158,7 +158,7 @@ Ignore these messages; registering the coordinator as an [RPC server](https://go
 *   The worker's map task code will need a way to store intermediate key/value pairs in files in a way that can be correctly read back during reduce tasks. One possibility is to use Go's `encoding/json` package. To write key/value pairs in JSON format to an open file:
     ```go
         enc := json.NewEncoder(file)
-        for \_, kv := ... {
+        for _, kv := ... {
           err := enc.Encode(&kv)
     ```                    
     
