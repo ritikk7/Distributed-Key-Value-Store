@@ -41,7 +41,7 @@ ACT 8
 
 Feel free to borrow code from `mrsequential.go`. You should also have a look at `mrapps/wc.go` to see what MapReduce application code looks like.
 
-For this lab and all the others, we might issue updates to the code we provide you. To ensure that you can fetch those updates and easily merge them using `git pull`, it's best to leave the code we provide in the original files. You can add to the code we provide as directed in the lab write-ups; just don't move it. It's OK to put your own new functions in new files.
+For this lab and all the others, we might issue updates to the code we provide you. To ensure that you can fetch those updates and easily merge them using `git pull`, it's best to leave the code we provide in the original files. You can add to the code we provide as directed in the lab write-ups; just don't move it. It's OK to put your own new functions in new files (although we suggest that it is sufficent and easiest to implement the labs by changing only the requested files).
 
 ### Your job
 
