@@ -27,7 +27,7 @@ We supply you with a simple sequential mapreduce implementation in `src/main/mrs
 $ cd ~/cpsc416-2023w2-golabs/
 $ cd src/main
 $ go build -buildmode=plugin ../mrapps/wc.go
-$ rm mr-out\*
+$ rm mr-out.*
 $ go run mrsequential.go wc.so pg*.txt
 $ more mr-out-0
 A 509
