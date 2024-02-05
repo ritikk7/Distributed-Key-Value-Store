@@ -53,6 +53,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term int
+	Data interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -64,25 +69,32 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm   int
-	votedFor      int
-	log           []int
-	commitIndex   int
-	lastApplied   int
-	nextIndex     int
-	matchIndex    int
-	leaderId      int
+
+	// Persisted
+	currentTerm int
+	votedFor    int
+	logs        []LogEntry
+
+	// Volatile
+	commitIndex int
+	lastApplied int
+	nextIndex   int
+	matchIndex  int
+
+	leaderId int
+	state    string // "follower", "leader", "candidate"
+
 	heartbeatTime time.Time
-	state         string // "follower", "leader", "candidate"
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.state == LEADER
 	return term, isleader
 }
 
@@ -151,9 +163,49 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (rf *Raft) shouldGrantVote(args *RequestVoteArgs) bool {
+	lastLogIndex := len(rf.logs) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.logs[lastLogIndex].Term
+	}
+
+	upToDate := args.LastLogTerm > lastLogTerm ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	return (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate
+}
+
+func (rf *Raft) becomeFollower(newTerm int) {
+	rf.currentTerm = newTerm
+	rf.votedFor = -1
+	rf.state = FOLLOWER
+	rf.leaderId = -1
+	rf.persist()
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+
+	if rf.shouldGrantVote(args) {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.persist()
+	}
 }
 
 type AppendEntriesArgs struct {
