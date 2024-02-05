@@ -264,9 +264,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) (ok bool, granted bool) {
+	ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok, reply.VoteGranted
 }
 
 func (rf *Raft) sendHeartbeat() {
@@ -289,6 +289,37 @@ func (rf *Raft) sendHeartbeat() {
 	time.Sleep(120 * time.Millisecond)
 	//ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	//return ok
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != LEADER {
+		rf.state = CANDIDATE
+		rf.currentTerm++
+		rf.votedFor = rf.me
+		votes := 1
+
+		for idx, _ := range rf.peers {
+			if idx == rf.me {
+				continue
+			}
+			idx := idx
+			go func() {
+				args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+				reply := RequestVoteReply{}
+				rf.sendRequestVote(idx, &args, &reply)
+				if reply.VoteGranted {
+					votes++
+					if votes*2 > len(rf.peers) {
+						// got majority
+						rf.state = LEADER
+					}
+				}
+			}()
+		}
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -339,6 +370,8 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		if time.Since(rf.heartbeatTime) > 500*time.Millisecond {
 			// TODO: handle election
+			rf.startElection()
+			return
 		}
 
 		// pause for a random amount of time between 50 and 350
