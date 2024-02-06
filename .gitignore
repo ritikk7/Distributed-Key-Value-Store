@@ -1,3 +1,4 @@
 pkg/
 .vscode
 .idea/
+.DS_Store
