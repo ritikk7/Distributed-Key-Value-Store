@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -188,7 +187,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	fmt.Printf("%v recv req vote from %v\n", rf.me, args.CandidateId)
+	//fmt.Printf("%v recv req vote from %v\n", rf.me, args.CandidateId)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -196,7 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 
 	if args.Term < rf.currentTerm {
-		fmt.Printf("%v voted: %v to %v\n", rf.me, reply.VoteGranted, args.CandidateId)
+		//fmt.Printf("%v voted: %v to %v\n", rf.me, reply.VoteGranted, args.CandidateId)
 		return
 	}
 
@@ -209,7 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.persist()
 	}
-	fmt.Printf("%v voted: %v to %v\n", rf.me, reply.VoteGranted, args.CandidateId)
+	//fmt.Printf("%v voted: %v to %v\n", rf.me, reply.VoteGranted, args.CandidateId)
 }
 
 type AppendEntriesArgs struct {
@@ -234,7 +233,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	fmt.Printf("%v recv append entries from %v\n", rf.me, args.LeaderId)
+	//fmt.Printf("%v recv append entries from %v\n", rf.me, args.LeaderId)
 	rf.state = FOLLOWER
 	rf.currentTerm = args.Term
 	rf.heartbeatTime = time.Now()
@@ -284,7 +283,7 @@ func (rf *Raft) sendHeartbeat() {
 				if id == rf.me {
 					continue
 				}
-				fmt.Printf("%v send heartbeat to %v\n", rf.me, id)
+				//fmt.Printf("%v send heartbeat to %v\n", rf.me, id)
 				peer.Call("Raft.AppendEntries", &args, &reply)
 				if !reply.Success {
 					// discover server with higher term, become follower
@@ -303,7 +302,7 @@ func (rf *Raft) sendHeartbeat() {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("%v start election\n", rf.me)
+	//fmt.Printf("%v start election\n", rf.me)
 	rf.state = CANDIDATE
 	if rf.state == CANDIDATE {
 		//rf.state = CANDIDATE
@@ -319,14 +318,14 @@ func (rf *Raft) startElection() {
 			go func() {
 				args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
 				reply := RequestVoteReply{}
-				fmt.Printf("%v send req vote to %v\n", rf.me, server)
+				//fmt.Printf("%v send req vote to %v\n", rf.me, server)
 				_, granted := rf.sendRequestVote(server, &args, &reply)
 				if granted {
 					votes++
-					fmt.Printf("%v vote granted\n", rf.me)
+					//fmt.Printf("%v vote granted\n", rf.me)
 					if votes*2 > len(rf.peers) {
 						// got majority
-						fmt.Printf("%v became leader\n", rf.me)
+						//fmt.Printf("%v became leader\n", rf.me)
 						rf.state = LEADER
 						return
 					}
@@ -415,7 +414,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	fmt.Printf("len peers: %v\n", len(rf.peers))
+	//fmt.Printf("len peers: %v\n", len(rf.peers))
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = FOLLOWER
