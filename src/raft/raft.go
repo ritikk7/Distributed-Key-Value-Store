@@ -58,8 +58,9 @@ const (
 )
 
 type LogEntry struct {
-	term  int
-	index int
+	term    int
+	index   int         // first index = 1
+	command interface{} // command for log entry
 }
 
 // A Go object implementing a single Raft peer.
@@ -78,7 +79,7 @@ type Raft struct {
 	currTerm  int32      // current term at this Raft
 	votedFor  int        // the peer this Raft voted for during the last election
 	heartbeat bool       // keeps track of the heartbeats
-	logs      []LogEntry // list of log entries
+	logs      []LogEntry // list of LogEntry
 }
 
 // return currentTerm and whether this server
