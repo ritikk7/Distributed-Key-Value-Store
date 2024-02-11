@@ -75,11 +75,15 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	raftState RaftState  // the current state of this Raft (Follower, Candidate, Leader)
-	currTerm  int32      // current term at this Raft
-	votedFor  int        // the peer this Raft voted for during the last election
-	heartbeat bool       // keeps track of the heartbeats
-	logs      []LogEntry // list of LogEntry
+	raftState   RaftState  // the current state of this Raft (Follower, Candidate, Leader)
+	currTerm    int        // current term at this Raft
+	votedFor    int        // the peer this Raft voted for during the last election
+	heartbeat   bool       // keeps track of the heartbeats
+	logs        []LogEntry // list of LogEntry
+	commitIndex int        // index of highest log entry known to be committed
+	lastApplied int        // index of highest log entry applied to state machine
+	nextIndex   []int      // index of the next log entry to send to that server
+	matchIndex  []int      // index of highest log entry known to be replicated on server
 }
 
 // return currentTerm and whether this server
@@ -143,7 +147,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int32
+	Term        int
 	CandId      int
 	LastLogIdx  int
 	LastLogTerm int
@@ -153,7 +157,7 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int32
+	Term        int
 	VoteGranted bool
 }
 
@@ -242,19 +246,52 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.me == rf.leaderId
 
-	// Your code here (2B).
+	// if not leader, return false
+	if !isLeader {
+		return -1, -1, false
+	}
+
+	// 5.3: The leader appends the command to its log as a new entry,
+	// then issues AppendEntries RPCs in parallel to each of the
+	// other servers to replicate the entry
+
+	// TODO: is this correct?
+	// add command to log
+	term = rf.currTerm
+	index = len(rf.logs) + 1
+	logEntry := LogEntry{term: term, index: index, command: command}
+	rf.logs[index-1] = logEntry
+
+	// issue AppendEntries RPC to followers
+	// 5.3: leader must find the latest log entry where the two
+	// logs agree, delete any entries in the follower’s log after
+	// that point, and send the follower all of the leader’s entries
+	// after that point
+	for i, peer := range rf.peers {
+		if i != rf.me {
+			args := AppendEntriesArg{}
+			args.Term = term
+			args.LeaderId = rf.me
+			reply := AppendEntriesReply{}
+			peer.Call("Raft.AppendEntries", &args, &reply)
+		}
+	}
 
 	return index, term, isLeader
 }
 
 type AppendEntriesArg struct {
-	Term     int32
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 type AppendEntriesReply struct {
-	Term    int32
+	Term    int
 	Success bool
 }
 
