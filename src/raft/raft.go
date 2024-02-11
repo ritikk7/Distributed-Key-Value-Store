@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -57,10 +58,12 @@ const (
 	Leader
 )
 
+const shouldPrint = true
+
 type LogEntry struct {
-	term    int
-	index   int         // first index = 1
-	command interface{} // command for log entry
+	Term    int
+	Index   int         // first index = 1
+	Command interface{} // command for log entry
 }
 
 // A Go object implementing a single Raft peer.
@@ -84,6 +87,13 @@ type Raft struct {
 	lastApplied int        // index of highest log entry applied to state machine
 	nextIndex   []int      // index of the next log entry to send to that server
 	matchIndex  []int      // index of highest log entry known to be replicated on server
+}
+
+// use this to print stuff
+func sout(format string, v ...any) {
+	if shouldPrint {
+		log.Printf(format, v...)
+	}
 }
 
 // return currentTerm and whether this server
@@ -179,10 +189,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// if the requester last log term/index is less than my last log term/index: reject
-	if (args.LastLogTerm < rf.logs[len(rf.logs)-1].term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].index) {
-		reply.VoteGranted = false
-		return
+	sout("len: %v\n", len(rf.logs))
+	if len(rf.logs) > 0 {
+		if (args.LastLogTerm < rf.logs[len(rf.logs)-1].Term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].Index) {
+			reply.VoteGranted = false
+			return
+		}
 	}
+	//if len(rf.logs) > 0 && (args.LastLogTerm < rf.logs[len(rf.logs)-1].term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].index) {
+	//	reply.VoteGranted = false
+	//	return
+	//}
 
 	// if the requester term is more than me, it means that it is an election period; I grant the vote
 	if args.Term > rf.currTerm {
@@ -253,6 +270,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	// 5.3: The leader appends the command to its log as a new entry,
 	// then issues AppendEntries RPCs in parallel to each of the
 	// other servers to replicate the entry
@@ -261,8 +281,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// add command to log
 	term = rf.currTerm
 	index = len(rf.logs) + 1
-	logEntry := LogEntry{term: term, index: index, command: command}
-	rf.logs[index-1] = logEntry
+	logEntry := LogEntry{Term: term, Index: index, Command: command}
+	rf.logs = append(rf.logs, logEntry)
 
 	// issue AppendEntries RPC to followers
 	// 5.3: leader must find the latest log entry where the two
@@ -272,10 +292,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	for i, peer := range rf.peers {
 		if i != rf.me {
 			for {
+				sout("len - %v\n", len(rf.logs))
+				sout("ni - %v\n", rf.nextIndex[i])
+				prevLogTerm := -1
+				if rf.nextIndex[i]-2 > 0 {
+					prevLogTerm = rf.logs[rf.nextIndex[i]-2].Term
+				}
 				args := AppendEntriesArg{
-					Term:     term,
-					LeaderId: rf.me,
-					Entries:  rf.logs[rf.nextIndex[i]:],
+					Term:         term,
+					LeaderId:     rf.me,
+					Entries:      rf.logs[rf.nextIndex[i]:],
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  prevLogTerm,
+					LeaderCommit: rf.commitIndex,
 				}
 				reply := AppendEntriesReply{}
 				peer.Call("Raft.AppendEntries", &args, &reply)
@@ -285,6 +314,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				}
 				// decrement nextIndex and retry
 				rf.nextIndex[i] -= 1
+				sout("AppendEntries not success, decrement nextIndex : rf.nextIndex[%v] = %v\n", i, rf.nextIndex[i])
 			}
 		}
 	}
@@ -321,7 +351,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	rf.leaderId = args.LeaderId
 	rf.currTerm = args.Term
 
+	// is heartbeat, no need to check logs
+	if len(args.Entries) == 0 {
+		return
+	}
+	sout("%v: x\n", rf.me)
+	sout("prev log idx: %v\n", args.PrevLogIndex)
 	// TODO: check for log inconsistency
+	// if log at PrevLogIndex doesn't match, return false
+	if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		sout("AppendEntries fail\n")
+		reply.Success = false
+		return
+	}
+	sout("%v: y\n", rf.me)
+	// remove all logs after PrevLogIndex
+	rf.logs = rf.logs[:args.PrevLogIndex]
+	rf.logs = append(rf.logs, args.Entries...)
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit > args.PrevLogIndex+len(args.Entries) {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = args.PrevLogIndex + len(args.Entries)
+		}
+	}
+	reply.Success = true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -449,11 +503,9 @@ func (rf *Raft) startElection() {
 		rf.mu.Lock()
 		rf.raftState = Leader
 		rf.leaderId = rf.me
-		for i, _ := range rf.peers {
-			if i != rf.me {
-				rf.nextIndex[i] = len(rf.logs) + 1
-				rf.matchIndex[i] = 0
-			}
+		for range rf.peers {
+			rf.nextIndex = append(rf.nextIndex, len(rf.logs)+1)
+			rf.matchIndex = append(rf.matchIndex, 0)
 		}
 		rf.mu.Unlock()
 
