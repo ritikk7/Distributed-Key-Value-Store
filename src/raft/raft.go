@@ -49,6 +49,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type RaftState int
+
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -56,21 +64,25 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	leaderId  int                 // the id of the leader for the current term
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	raftState RaftState // the current state of this Raft (Follower, Candidate, Leader)
+	currTerm  int32     // current term at this Raft
+	votedFor  int       // the peer this Raft voted for during the last election
+	heartbeat bool      // keeps track of the heartbeats
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return int(rf.currTerm), rf.raftState == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -124,17 +136,50 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int32
+	CandId      int
+	LastLogIdx  int
+	LastLogTerm int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int32
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
+
+	// I can vote if:
+	// 1 - the term of the requester is >= of my term
+	// 2 - I haven't voted for the requested term before
+
+	// if the requester term is behind me, it means that the requester is out of sync; I reject the vote
+	if args.Term < rf.currTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currTerm
+		return
+	}
+
+	// if the requester term is more than me, it means that it is an election period; I grant the vote
+	if args.Term > rf.currTerm {
+		rf.currTerm = args.Term // reset my term to the new one
+		rf.raftState = Follower // reset my state to Follower until the election ends or I become a Candidate
+		rf.votedFor = -1        // reset my vote
+	}
+
+	// rf.votedFor < 0: it's a new term; I should grant the vote if I haven't granted my vote to someone else
+	if rf.votedFor < 0 || rf.votedFor == args.CandId {
+		rf.votedFor = args.CandId
+		reply.VoteGranted = true
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -191,6 +236,33 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+type AppendEntriesArg struct {
+	Term     int32
+	LeaderId int
+}
+type AppendEntriesReply struct {
+	Term    int32
+	Success bool
+}
+
+// HeartBeat reset the timer if it is called by the leader
+func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currTerm {
+		reply.Term = rf.currTerm
+		reply.Success = false
+		return
+	}
+
+	rf.heartbeat = true
+	rf.raftState = Follower
+	rf.leaderId = args.LeaderId
+	rf.currTerm = args.Term
+
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -210,16 +282,138 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
+func (rf *Raft) startSendingHB() {
 
+	// check if I'm still the leader before sending HBs
+	for !rf.killed() && rf.raftState == Leader {
+		rf.mu.Lock()
+		currTerm := rf.currTerm
+		leaderId := rf.me
+		rf.mu.Unlock()
+		for i := range rf.peers {
+			if i != rf.me {
+				go func(i int) {
+					args := &AppendEntriesArg{
+						Term:     currTerm,
+						LeaderId: leaderId,
+					}
+					reply := &AppendEntriesReply{}
+					ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+
+					rf.mu.Lock()
+					if ok && reply.Term > rf.currTerm {
+						rf.raftState = Follower
+						rf.currTerm = reply.Term
+					}
+					rf.mu.Unlock()
+				}(i)
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// startEelction starts an election
+func (rf *Raft) startElection() {
+	// starting a new election
+	rf.mu.Lock()
+
+	// only Followers and Candidates can start elections
+	// skip if I'm a leader - might happen when there was timeout from previous elections or another leader is selected
+	if rf.raftState == Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	// 0. transition to the Candidate state
+	rf.raftState = Candidate
+
+	// 1. increment my term
+	rf.currTerm += 1
+
+	// 2. vote for myself
+	rf.votedFor = rf.me
+
+	// 3. ask others to vote for me as well
+	args := &RequestVoteArgs{}
+	args.Term = rf.currTerm
+	args.CandId = rf.me
+
+	rf.mu.Unlock()
+
+	// should ask the peers in parallel for their vote;
+	// so we'll wait on this channel after sending the requests in parallel
+	voteCh := make(chan bool)
+
+	gotVotes := 1                   // gotVotes counts granted votes for me in this round of election; counted my vote already
+	majority := len(rf.peers)/2 + 1 // majority is the threshold for winning the current election
+	recVotes := 1                   // recVotes counts all peers voted (mine counted); in case we haven't reached a majority of votes
+
+	// asking peers to vote until
+	// 1. I win!
+	// 2. someone else wins!
+	// 3. another timeout happens
+	for i := 0; i < len(rf.peers); i += 1 {
+		// skip asking myself - already voted
+		if i != rf.me {
+			go func(i int) {
+				reply := &RequestVoteReply{}
+				ok := rf.sendRequestVote(i, args, reply)
+				voteCh <- ok && reply.VoteGranted
+			}(i)
+		}
+	}
+
+	// let's count the votes
+	for gotVotes < majority && recVotes < len(rf.peers) {
+		if <-voteCh {
+			gotVotes += 1
+		}
+		recVotes += 1
+	}
+
+	// counting ended; let's see the results
+	// 1. let's check if there's another server who has already been elected
+	rf.mu.Lock()
+	if rf.raftState != Candidate {
+		// I'm not a Candidate anymore; we're done with counting
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	// Did I get the majority of votes?
+	if gotVotes >= majority {
+		// change state to Leader
+		rf.mu.Lock()
+		rf.raftState = Leader
+		rf.leaderId = rf.me
+		rf.mu.Unlock()
+
+		// start sending HBs
+		go rf.startSendingHB()
+	}
+}
+
+func (rf *Raft) ticker() {
+	var ms int64
+
+	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// avoid the first vote split in the first round of election
+		ms = 350 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		// check if we got a heartbeat from the leader
+		// if we haven't recieved any hearts; start an election
+		if !rf.heartbeat {
+			go rf.startElection()
+		}
+		// reset the heartbeat
+		rf.heartbeat = false
+
 	}
 }
 
@@ -234,12 +428,20 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf := &Raft{
+		mu:        sync.Mutex{},
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		dead:      0,
+		leaderId:  -1,
+		raftState: Follower,
+		currTerm:  0,
+		votedFor:  -1,
+		heartbeat: false,
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
