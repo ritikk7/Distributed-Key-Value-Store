@@ -271,11 +271,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// after that point
 	for i, peer := range rf.peers {
 		if i != rf.me {
-			args := AppendEntriesArg{}
-			args.Term = term
-			args.LeaderId = rf.me
-			reply := AppendEntriesReply{}
-			peer.Call("Raft.AppendEntries", &args, &reply)
+			for {
+				args := AppendEntriesArg{}
+				args.Term = term
+				args.LeaderId = rf.me
+				args.Entries = rf.logs[rf.nextIndex[i]:]
+				reply := AppendEntriesReply{}
+				peer.Call("Raft.AppendEntries", &args, &reply)
+				if reply.Success == true {
+					break
+				}
+				rf.nextIndex[i] -= 1
+			}
 		}
 	}
 
@@ -310,7 +317,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	rf.raftState = Follower
 	rf.leaderId = args.LeaderId
 	rf.currTerm = args.Term
-
+	
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -438,6 +445,12 @@ func (rf *Raft) startElection() {
 		rf.mu.Lock()
 		rf.raftState = Leader
 		rf.leaderId = rf.me
+		for i, _ := range rf.peers {
+			if i != rf.me {
+				rf.nextIndex[i] = len(rf.logs) + 1
+				rf.matchIndex[i] = 0
+			}
+		}
 		rf.mu.Unlock()
 
 		// start sending HBs
