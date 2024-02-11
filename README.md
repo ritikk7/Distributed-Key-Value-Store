@@ -14,6 +14,17 @@
 
 1. For debugging pursposes, you may need to make changes to files specified as unchangeable, e.g., you may decide to comment out or modify the testing functions to understand exactly where your code is failing. Feel free to make such changes. However, ensure that your program ultimately compiles and runs with the original versions of these files.
 
+# Your Repository MUST NOT Be Public
+Make sure your work is private to you and your teammate. Your code must not be made available to the public. If you fork this repository, ensure that it does not contain any solutions.
+
+This is a suggested approach for collaboration. You can use any other method to keep it private:
+
+- Create a private repo (add your teammate as your member).
+- Clone the public repo.
+- Add a new remote to your private repository.
+- Push your changes to the private repo and collaborate with your teammate.
+- For each lab, pull from the public repository.
+
 # Submitting Your Code
 
 You will submit your solutions on **Canvas**. When submitting your code:
