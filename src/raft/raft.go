@@ -272,10 +272,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	for i, peer := range rf.peers {
 		if i != rf.me {
 			for {
-				args := AppendEntriesArg{}
-				args.Term = term
-				args.LeaderId = rf.me
-				args.Entries = rf.logs[rf.nextIndex[i]:]
+				args := AppendEntriesArg{
+					Term:     term,
+					LeaderId: rf.me,
+					Entries:  rf.logs[rf.nextIndex[i]:],
+				}
 				reply := AppendEntriesReply{}
 				peer.Call("Raft.AppendEntries", &args, &reply)
 				if reply.Success == true {
@@ -317,7 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	rf.raftState = Follower
 	rf.leaderId = args.LeaderId
 	rf.currTerm = args.Term
-	
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
