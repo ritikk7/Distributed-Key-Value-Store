@@ -57,6 +57,11 @@ const (
 	Leader
 )
 
+type LogEntry struct {
+	term  int
+	index int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -69,10 +74,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	raftState RaftState // the current state of this Raft (Follower, Candidate, Leader)
-	currTerm  int32     // current term at this Raft
-	votedFor  int       // the peer this Raft voted for during the last election
-	heartbeat bool      // keeps track of the heartbeats
+	raftState RaftState  // the current state of this Raft (Follower, Candidate, Leader)
+	currTerm  int32      // current term at this Raft
+	votedFor  int        // the peer this Raft voted for during the last election
+	heartbeat bool       // keeps track of the heartbeats
+	logs      []LogEntry // list of log entries
 }
 
 // return currentTerm and whether this server
@@ -164,6 +170,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currTerm
+		return
+	}
+
+	// if the requester last log term/index is less than my last log term/index: reject
+	if (args.LastLogTerm < rf.logs[len(rf.logs)-1].term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].index) {
+		reply.VoteGranted = false
 		return
 	}
 
