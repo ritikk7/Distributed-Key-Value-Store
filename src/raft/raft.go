@@ -280,8 +280,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				reply := AppendEntriesReply{}
 				peer.Call("Raft.AppendEntries", &args, &reply)
 				if reply.Success == true {
+					// follower log now consistent with leader
 					break
 				}
+				// decrement nextIndex and retry
 				rf.nextIndex[i] -= 1
 			}
 		}
@@ -319,6 +321,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	rf.leaderId = args.LeaderId
 	rf.currTerm = args.Term
 
+	// TODO: check for log inconsistency
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
