@@ -87,6 +87,7 @@ type Raft struct {
 	lastApplied int        // index of highest log entry applied to state machine
 	nextIndex   []int      // index of the next log entry to send to that server
 	matchIndex  []int      // index of highest log entry known to be replicated on server
+	applyCh     chan ApplyMsg
 }
 
 // use this to print stuff
@@ -103,7 +104,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	// Your code here (2A).
-	return int(rf.currTerm), rf.raftState == Leader
+	return rf.currTerm, rf.raftState == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -190,8 +191,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// if the requester last log term/index is less than my last log term/index: reject
 	sout("len: %v\n", len(rf.logs))
-	if len(rf.logs) > 0 {
+	sout("args.LastLogTerm: %v, term: %v, args.LastLogIdx: %v, idx: %v\n", args.LastLogTerm, rf.logs[len(rf.logs)-1].Term, args.LastLogIdx, rf.logs[len(rf.logs)-1].Index)
+	if len(rf.logs) > 1 {
 		if (args.LastLogTerm < rf.logs[len(rf.logs)-1].Term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].Index) {
+			sout("1\n")
 			reply.VoteGranted = false
 			return
 		}
@@ -280,7 +283,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// TODO: is this correct?
 	// add command to log
 	term = rf.currTerm
-	index = len(rf.logs) + 1
+	index = len(rf.logs)
 	logEntry := LogEntry{Term: term, Index: index, Command: command}
 	rf.logs = append(rf.logs, logEntry)
 
@@ -289,27 +292,43 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// logs agree, delete any entries in the follower’s log after
 	// that point, and send the follower all of the leader’s entries
 	// after that point
+	numConsistent := 1
+	applyEntryCh := make(chan bool)
 	for i, peer := range rf.peers {
 		if i != rf.me {
 			for {
 				sout("len - %v\n", len(rf.logs))
 				sout("ni - %v\n", rf.nextIndex[i])
-				prevLogTerm := -1
-				if rf.nextIndex[i]-2 > 0 {
-					prevLogTerm = rf.logs[rf.nextIndex[i]-2].Term
-				}
-				args := AppendEntriesArg{
-					Term:         term,
-					LeaderId:     rf.me,
-					Entries:      rf.logs[rf.nextIndex[i]:],
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  prevLogTerm,
-					LeaderCommit: rf.commitIndex,
-				}
-				reply := AppendEntriesReply{}
-				peer.Call("Raft.AppendEntries", &args, &reply)
-				if reply.Success == true {
+				go func() {
+					prevLogTerm := -1
+					if rf.nextIndex[i]-1 > 0 {
+						// prevLogTerm exist
+						prevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+					}
+					args := AppendEntriesArg{
+						Term:         term,
+						LeaderId:     rf.me,
+						Entries:      rf.logs[rf.nextIndex[i]:],
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  prevLogTerm,
+						LeaderCommit: rf.commitIndex,
+					}
+					reply := AppendEntriesReply{}
+					ok := peer.Call("Raft.AppendEntries", &args, &reply)
+					applyEntryCh <- ok && reply.Success
+				}()
+				if <-applyEntryCh {
 					// follower log now consistent with leader
+					numConsistent++
+					if numConsistent > len(rf.logs)/2+1 {
+						rf.commitIndex = index
+						applyMsg := ApplyMsg{
+							CommandValid: true,
+							Command:      command,
+							CommandIndex: index,
+						}
+						rf.applyCh <- applyMsg
+					}
 					break
 				}
 				// decrement nextIndex and retry
@@ -318,7 +337,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		}
 	}
-
+	sout("start return\n")
 	return index, term, isLeader
 }
 
@@ -341,6 +360,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currTerm {
+		sout("xx\n")
 		reply.Term = rf.currTerm
 		reply.Success = false
 		return
@@ -359,14 +379,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	sout("prev log idx: %v\n", args.PrevLogIndex)
 	// TODO: check for log inconsistency
 	// if log at PrevLogIndex doesn't match, return false
-	if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		sout("AppendEntries fail\n")
-		reply.Success = false
-		return
+	if len(rf.logs) > 1 {
+		if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+			sout("AppendEntries fail\n")
+			reply.Success = false
+			return
+		}
 	}
 	sout("%v: y\n", rf.me)
 	// remove all logs after PrevLogIndex
-	rf.logs = rf.logs[:args.PrevLogIndex]
+	if args.PrevLogIndex > 0 {
+		rf.logs = rf.logs[:args.PrevLogIndex]
+	}
 	rf.logs = append(rf.logs, args.Entries...)
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit > args.PrevLogIndex+len(args.Entries) {
@@ -453,6 +477,8 @@ func (rf *Raft) startElection() {
 	args := &RequestVoteArgs{}
 	args.Term = rf.currTerm
 	args.CandId = rf.me
+	args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
+	args.LastLogIdx = rf.logs[len(rf.logs)-1].Index
 
 	rf.mu.Unlock()
 
@@ -504,7 +530,7 @@ func (rf *Raft) startElection() {
 		rf.raftState = Leader
 		rf.leaderId = rf.me
 		for range rf.peers {
-			rf.nextIndex = append(rf.nextIndex, len(rf.logs)+1)
+			rf.nextIndex = append(rf.nextIndex, len(rf.logs))
 			rf.matchIndex = append(rf.matchIndex, 0)
 		}
 		rf.mu.Unlock()
@@ -561,6 +587,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		votedFor:  -1,
 		heartbeat: false,
 	}
+	placeholderLog := LogEntry{Index: -1}
+	rf.logs = append(rf.logs, placeholderLog)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
