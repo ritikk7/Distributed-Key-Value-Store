@@ -58,6 +58,18 @@ const (
 	Leader
 )
 
+const (
+	ColorRed     = "\033[31m"
+	ColorGreen   = "\033[32m"
+	ColorYellow  = "\033[33m"
+	ColorBlue    = "\033[34m"
+	ColorMagenta = "\033[35m"
+	ColorCyan    = "\033[36m"
+	ColorReset   = "\033[0m"
+)
+
+var colors = [6]string{ColorRed, ColorGreen, ColorYellow, ColorBlue, ColorMagenta, ColorCyan}
+
 const shouldPrint = true
 
 type LogEntry struct {
@@ -88,12 +100,17 @@ type Raft struct {
 	nextIndex   []int      // index of the next log entry to send to that server
 	matchIndex  []int      // index of highest log entry known to be replicated on server
 	applyCh     chan ApplyMsg
+	color       string
 }
 
 // use this to print stuff
-func sout(format string, v ...any) {
+func sout(rf *Raft, format string, v ...any) {
 	if shouldPrint {
-		log.Printf(format, v...)
+		if rf == nil {
+			log.Printf(format, v...)
+		} else {
+			log.Printf(rf.color+format+ColorReset, v...)
+		}
 	}
 }
 
@@ -190,11 +207,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// if the requester last log term/index is less than my last log term/index: reject
-	sout("len: %v\n", len(rf.logs))
-	sout("args.LastLogTerm: %v, term: %v, args.LastLogIdx: %v, idx: %v\n", args.LastLogTerm, rf.logs[len(rf.logs)-1].Term, args.LastLogIdx, rf.logs[len(rf.logs)-1].Index)
+	sout(rf, "len: %v\n", len(rf.logs))
+	sout(rf, "args.LastLogTerm: %v, term: %v, args.LastLogIdx: %v, idx: %v\n", args.LastLogTerm, rf.logs[len(rf.logs)-1].Term, args.LastLogIdx, rf.logs[len(rf.logs)-1].Index)
 	if len(rf.logs) > 1 {
 		if (args.LastLogTerm < rf.logs[len(rf.logs)-1].Term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].Index) {
-			sout("1\n")
+			sout(rf, "1\n")
 			reply.VoteGranted = false
 			return
 		}
@@ -279,6 +296,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 5.3: The leader appends the command to its log as a new entry,
 	// then issues AppendEntries RPCs in parallel to each of the
 	// other servers to replicate the entry
+	sout(rf, "leader is: %v\n"+ColorReset, rf.me)
 
 	// TODO: is this correct?
 	// add command to log
@@ -286,6 +304,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.logs)
 	logEntry := LogEntry{Term: term, Index: index, Command: command}
 	rf.logs = append(rf.logs, logEntry)
+	sout(rf, "leader log: %v\n"+ColorReset, rf.logs)
 
 	// issue AppendEntries RPC to followers
 	// 5.3: leader must find the latest log entry where the two
@@ -293,51 +312,80 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// that point, and send the follower all of the leader’s entries
 	// after that point
 	numConsistent := 1
-	applyEntryCh := make(chan bool)
-	for i, peer := range rf.peers {
-		if i != rf.me {
-			for {
-				sout("len - %v\n", len(rf.logs))
-				sout("ni - %v\n", rf.nextIndex[i])
-				go func() {
-					prevLogTerm := -1
-					if rf.nextIndex[i]-1 > 0 {
-						// prevLogTerm exist
-						prevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
-					}
-					args := AppendEntriesArg{
-						Term:         term,
-						LeaderId:     rf.me,
-						Entries:      rf.logs[rf.nextIndex[i]:],
-						PrevLogIndex: rf.nextIndex[i] - 1,
-						PrevLogTerm:  prevLogTerm,
-						LeaderCommit: rf.commitIndex,
-					}
-					reply := AppendEntriesReply{}
-					ok := peer.Call("Raft.AppendEntries", &args, &reply)
-					applyEntryCh <- ok && reply.Success
-				}()
-				if <-applyEntryCh {
-					// follower log now consistent with leader
-					numConsistent++
-					if numConsistent > len(rf.logs)/2+1 {
-						rf.commitIndex = index
-						applyMsg := ApplyMsg{
-							CommandValid: true,
-							Command:      command,
-							CommandIndex: index,
-						}
-						rf.applyCh <- applyMsg
-					}
-					break
-				}
-				// decrement nextIndex and retry
-				rf.nextIndex[i] -= 1
-				sout("AppendEntries not success, decrement nextIndex : rf.nextIndex[%v] = %v\n", i, rf.nextIndex[i])
-			}
+	for idx, peer := range rf.peers {
+		if idx == rf.me {
+			continue
 		}
+		i := idx
+		peer := peer
+		go func() {
+			success := false
+			for success == false {
+				prevLogTerm := -1
+				if rf.nextIndex[i]-1 > 0 {
+					// prevLogTerm exist
+					prevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+				}
+				args := AppendEntriesArg{
+					Term:         term,
+					LeaderId:     rf.me,
+					Entries:      rf.logs[rf.nextIndex[i]:],
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  prevLogTerm,
+					LeaderCommit: rf.commitIndex,
+				}
+				sout(rf, "send to %v: PrevLogIndex: %v, PrevLogTerm: %v\n", i, args.PrevLogIndex, args.PrevLogTerm)
+				reply := AppendEntriesReply{}
+				ok := peer.Call("Raft.AppendEntries", &args, &reply)
+				if !ok {
+					sout(rf, "unable to reach %v\n", i)
+					return
+				}
+				if reply.Success {
+					numConsistent++
+					success = true
+					sout(rf, "%v now consistent\n", i)
+					rf.nextIndex[i]++
+					if numConsistent*2 > len(rf.peers) {
+						// majority consistent
+						//if rf.commitIndex == index {
+						//	return
+						//}
+						sout(rf, "majority consistent, should update commit up to this point\n")
+						sout(rf, "commit idx: %v, index: %v\n", rf.commitIndex, index)
+						for nextCommit := rf.commitIndex + 1; nextCommit < index+1; nextCommit++ {
+							sout(rf, "committing log index %v\n", nextCommit)
+							applyMsg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.logs[nextCommit].Command,
+								CommandIndex: rf.logs[nextCommit].Index,
+							}
+							rf.applyCh <- applyMsg
+							sout(rf, "---leader applied log index [%v]: %v---\n", nextCommit, applyMsg)
+						}
+						rf.commitIndex = index
+						//applyMsg := ApplyMsg{
+						//	CommandValid: true,
+						//	Command:      command,
+						//	CommandIndex: index,
+						//}
+						//rf.applyCh <- applyMsg
+						//sout(rf, "---leader applied log: %v---\n", applyMsg)
+					}
+				} else {
+					if reply.Term > rf.currTerm {
+						// discover server with higher term number
+						rf.raftState = Follower
+						return
+					}
+					sout(rf, "send log fail to: %v\n", i)
+					rf.nextIndex[i] -= 1
+				}
+			}
+		}()
 	}
-	sout("start return\n")
+
+	sout(rf, "start end\n")
 	return index, term, isLeader
 }
 
@@ -360,7 +408,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currTerm {
-		sout("xx\n")
+		sout(rf, "%v - args.term: %v, currTerm: %v\n", rf.me, args.Term, rf.currTerm)
+		sout(rf, "%v logs: %v\n", rf.me, rf.logs)
 		reply.Term = rf.currTerm
 		reply.Success = false
 		return
@@ -371,35 +420,61 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	rf.leaderId = args.LeaderId
 	rf.currTerm = args.Term
 
+	if len(args.Entries) != 0 {
+		sout(rf, "%v before commit idx: %v, leadercommit: %v", rf.me, rf.commitIndex, args.LeaderCommit)
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		uptodate := len(rf.logs) > args.LeaderCommit
+		if uptodate {
+			sout(rf, "%v should update commit - cidx:[%v] lcmt:[%v]\n", rf.me, rf.commitIndex, args.LeaderCommit)
+			for nextCommit := rf.commitIndex + 1; nextCommit < args.LeaderCommit+1; nextCommit++ {
+				sout(rf, "nextCommit: %v\n", nextCommit)
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[nextCommit].Command,
+					CommandIndex: rf.logs[nextCommit].Index,
+				}
+				rf.applyCh <- applyMsg
+				sout(rf, "---%v sent apply msg: [%v]---\n", rf.me, applyMsg)
+			}
+			rf.commitIndex = args.LeaderCommit
+			sout(rf, "%v update commit finish\n", rf.me)
+		}
+	}
+
 	// is heartbeat, no need to check logs
 	if len(args.Entries) == 0 {
 		return
 	}
-	sout("%v: x\n", rf.me)
-	sout("prev log idx: %v\n", args.PrevLogIndex)
+	sout(rf, "%v: x\n", rf.me)
+	sout(rf, "prev log idx: %v\n", args.PrevLogIndex)
 	// TODO: check for log inconsistency
 	// if log at PrevLogIndex doesn't match, return false
 	if len(rf.logs) > 1 {
 		if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-			sout("AppendEntries fail\n")
+			sout(rf, "%v AppendEntries fail\n", rf.me)
+			sout(rf, "%v logs: %v\n", rf.me, rf.logs)
+			sout(rf, "%v previdx: %v, prevterm: %v", rf.me, args.PrevLogIndex, args.PrevLogTerm)
 			reply.Success = false
 			return
 		}
 	}
-	sout("%v: y\n", rf.me)
+	sout(rf, "%v log before: %v\n", rf.me, rf.logs)
 	// remove all logs after PrevLogIndex
 	if args.PrevLogIndex > 0 {
-		rf.logs = rf.logs[:args.PrevLogIndex]
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
 	}
 	rf.logs = append(rf.logs, args.Entries...)
-	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit > args.PrevLogIndex+len(args.Entries) {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = args.PrevLogIndex + len(args.Entries)
-		}
-	}
+	//if args.LeaderCommit > rf.commitIndex {
+	//	if args.LeaderCommit > args.PrevLogIndex+len(args.Entries) {
+	//		rf.commitIndex = args.LeaderCommit
+	//	} else {
+	//		rf.commitIndex = args.PrevLogIndex + len(args.Entries)
+	//	}
+	//}
 	reply.Success = true
+	sout(rf, "%v log after: %v\n", rf.me, rf.logs)
+	sout(rf, "%v after commit idx: %v, leadercommit: %v", rf.me, rf.commitIndex, args.LeaderCommit)
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -433,8 +508,9 @@ func (rf *Raft) startSendingHB() {
 			if i != rf.me {
 				go func(i int) {
 					args := &AppendEntriesArg{
-						Term:     currTerm,
-						LeaderId: leaderId,
+						Term:         currTerm,
+						LeaderId:     leaderId,
+						LeaderCommit: rf.commitIndex,
 					}
 					reply := &AppendEntriesReply{}
 					ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
@@ -576,16 +652,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf := &Raft{
-		mu:        sync.Mutex{},
-		peers:     peers,
-		persister: persister,
-		me:        me,
-		dead:      0,
-		leaderId:  -1,
-		raftState: Follower,
-		currTerm:  0,
-		votedFor:  -1,
-		heartbeat: false,
+		mu:          sync.Mutex{},
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		dead:        0,
+		leaderId:    -1,
+		raftState:   Follower,
+		currTerm:    0,
+		votedFor:    -1,
+		heartbeat:   false,
+		commitIndex: 0,
+		applyCh:     applyCh,
+		color:       colors[me%6],
 	}
 	placeholderLog := LogEntry{Index: -1}
 	rf.logs = append(rf.logs, placeholderLog)
