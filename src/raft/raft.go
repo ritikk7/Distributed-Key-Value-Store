@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	"log"
+	"fmt"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -70,7 +70,7 @@ const (
 
 var colors = [6]string{ColorRed, ColorGreen, ColorYellow, ColorBlue, ColorMagenta, ColorCyan}
 
-const shouldPrint = true
+const shouldPrint = false
 
 type LogEntry struct {
 	Term    int
@@ -107,9 +107,9 @@ type Raft struct {
 func sout(rf *Raft, format string, v ...any) {
 	if shouldPrint {
 		if rf == nil {
-			log.Printf(format, v...)
+			fmt.Printf(format, v...)
 		} else {
-			log.Printf(rf.color+format+ColorReset, v...)
+			fmt.Printf(rf.color+format+ColorReset, v...)
 		}
 	}
 }
@@ -345,7 +345,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					numConsistent++
 					success = true
 					sout(rf, "%v now consistent\n", i)
-					rf.nextIndex[i]++
+					rf.nextIndex[i] = index + 1
 					if numConsistent*2 > len(rf.peers) {
 						// majority consistent
 						//if rf.commitIndex == index {
@@ -450,7 +450,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	sout(rf, "prev log idx: %v\n", args.PrevLogIndex)
 	// TODO: check for log inconsistency
 	// if log at PrevLogIndex doesn't match, return false
-	if len(rf.logs) > 1 {
+	if len(rf.logs) > 1 && args.PrevLogIndex > 0 {
 		if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			sout(rf, "%v AppendEntries fail\n", rf.me)
 			sout(rf, "%v logs: %v\n", rf.me, rf.logs)
