@@ -18,14 +18,15 @@ package raft
 //
 
 import (
-	"fmt"
 	//	"bytes"
+
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	// "cpsc416/labgob"
+	//	"cpsc416/labgob"
 	"cpsc416/labrpc"
 )
 
@@ -59,33 +60,28 @@ const (
 )
 
 const (
-	ColorRed     = "\033[31m"
-	ColorGreen   = "\033[32m"
-	ColorYellow  = "\033[33m"
-	ColorBlue    = "\033[34m"
-	ColorMagenta = "\033[35m"
-	ColorCyan    = "\033[36m"
-	ColorReset   = "\033[0m"
+	APPEND_ENTRIES_RPC = "Raft.AppendEntries"
+	REQUEST_VOTE_RPC   = "Raft.RequestVote"
 )
 
-var colors = [6]string{ColorRed, ColorGreen, ColorYellow, ColorBlue, ColorMagenta, ColorCyan}
-
-const shouldPrint = false
-
+// LogEntry represents each log entry in the rf.logs array
 type LogEntry struct {
 	Term    int
-	Index   int         // first index = 1
-	Command interface{} // command for log entry
+	Command interface{}
 }
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu   sync.Mutex // Lock to protect shared access to this peer's state
+	lock sync.Mutex // Lock to protect the shared accessed during log replication
+	cond *sync.Cond // Cond variable to synchronized the log replication go routines
+
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-	leaderId  int                 // the id of the leader for the current term
+
+	logger *Logger
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -94,24 +90,17 @@ type Raft struct {
 	currTerm    int        // current term at this Raft
 	votedFor    int        // the peer this Raft voted for during the last election
 	heartbeat   bool       // keeps track of the heartbeats
-	logs        []LogEntry // list of LogEntry
-	commitIndex int        // index of highest log entry known to be committed
-	lastApplied int        // index of highest log entry applied to state machine
-	nextIndex   []int      // index of the next log entry to send to that server
-	matchIndex  []int      // index of highest log entry known to be replicated on server
-	applyCh     chan ApplyMsg
-	color       string
-}
+	logs        []LogEntry // keeps the logs of the current Raft
+	commitIndex int        // index of highest log entry known to be commited (initalized to be 0)
+	lastApplied int        // index of highes log entry known to be applied to the SM (initalized to be 0)
+	leaderId    int        // index of the leader for Followers to redirect the requests to
 
-// use this to print stuff
-func sout(rf *Raft, format string, v ...any) {
-	if shouldPrint {
-		if rf == nil {
-			fmt.Printf(format, v...)
-		} else {
-			fmt.Printf(rf.color+format+ColorReset, v...)
-		}
-	}
+	// specific to the leader; must be re-initialized after election
+	nextIndex  []int // for each server, the index of the next log entry to send to that server (initialiazed to last log index + 1)
+	matchIndex []int // for each server, the index of the next log entry to be _replicated_ on other servers (initialized to be 0)
+
+	// channel to pass results to the server
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -121,7 +110,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	// Your code here (2A).
-	return rf.currTerm, rf.raftState == Leader
+	return int(rf.currTerm), rf.raftState == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -189,50 +178,55 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// example RequestVote RPC handler.
+// RequestVote called by Candidates to ask for the peer's vote
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// Your code here (2A, 2B).
 
-	// I can vote if:
-	// 1 - the term of the requester is >= of my term
-	// 2 - I haven't voted for the requested term before
-
-	// if the requester term is behind me, it means that the requester is out of sync; I reject the vote
+	// if the candidate's term is smaller than mine, I reject the vote
 	if args.Term < rf.currTerm {
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("S%d asked for a vote; args.Term(%d) is lower than mine (%d); rejecting to vote", args.CandId, args.Term, rf.currTerm))
 		reply.VoteGranted = false
 		reply.Term = rf.currTerm
 		return
 	}
 
-	// if the requester last log term/index is less than my last log term/index: reject
-	sout(rf, "len: %v\n", len(rf.logs))
-	sout(rf, "args.LastLogTerm: %v, term: %v, args.LastLogIdx: %v, idx: %v\n", args.LastLogTerm, rf.logs[len(rf.logs)-1].Term, args.LastLogIdx, rf.logs[len(rf.logs)-1].Index)
-	if len(rf.logs) > 1 {
-		if (args.LastLogTerm < rf.logs[len(rf.logs)-1].Term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].Index) {
-			sout(rf, "1\n")
-			reply.VoteGranted = false
-			return
-		}
-	}
-	//if len(rf.logs) > 0 && (args.LastLogTerm < rf.logs[len(rf.logs)-1].term) || (args.LastLogIdx < rf.logs[len(rf.logs)-1].index) {
-	//	reply.VoteGranted = false
-	//	return
-	//}
-
-	// if the requester term is more than me, it means that it is an election period; I grant the vote
+	// if the candidate's term is higher than mine:
+	//		1- update my term to the candidate's term
+	// 		2- turn into a follower
+	//		3- reset my vote
 	if args.Term > rf.currTerm {
-		rf.currTerm = args.Term // reset my term to the new one
-		rf.raftState = Follower // reset my state to Follower until the election ends or I become a Candidate
-		rf.votedFor = -1        // reset my vote
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("S%d term (%d) is higher than me (%d); turn into a follower with term=%d", args.CandId, args.Term, rf.currTerm, args.Term))
+		rf.currTerm = args.Term
+		rf.raftState = Follower
+		rf.votedFor = -1
 	}
 
-	// rf.votedFor < 0: it's a new term; I should grant the vote if I haven't granted my vote to someone else
-	if rf.votedFor < 0 || rf.votedFor == args.CandId {
-		rf.votedFor = args.CandId
-		reply.VoteGranted = true
+	// the candidate's get the vote if:
+	//	1- I haven't voted before
+	//	2- its log is more up-to-date than mine
+	if rf.votedFor >= 0 && rf.votedFor != args.CandId {
+		reply.Term = rf.currTerm
+		reply.VoteGranted = false
+		return
 	}
+
+	// the candidate has a more up-to-date log than me if:
+	//	1- my last log entry has a lower term than the candidate's last log term; or
+	//	2- if the last log terms matches betweem mine and the candidate, if the candidate has a longer log
+	lastLogIdx := len(rf.logs) - 1
+	if rf.logs[lastLogIdx].Term < args.LastLogTerm || (rf.logs[lastLogIdx].Term == args.LastLogTerm && args.LastLogIdx >= lastLogIdx) {
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE GRANTED: S%d log is more up-to-date; rf.votedFor=%d args.CandId=%d, rf.logs[%d].Term=%d < args.LastLogTerm(%d), args.LastLogIdx(%d) >= lastLogIdx(%d), my_logs=%+v ", args.CandId, args.CandId, args.CandId, lastLogIdx, rf.logs[lastLogIdx].Term, args.LastLogTerm, args.LastLogIdx, lastLogIdx, rf.logs))
+
+		rf.votedFor = args.CandId
+
+		reply.VoteGranted = true
+		reply.Term = rf.currTerm
+
+		return
+	}
+
+	rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE REJECTED; my log is more up-to-date than S%d; rf.votedFor=%d args.CandId=%d, rf.logs[%d].Term=%d < args.LastLogTerm(%d), args.LastLogIdx(%d) >= lastLogIdx(%d), my_logs=%+v ", args.CandId, rf.votedFor, args.CandId, lastLogIdx, rf.logs[lastLogIdx].Term, args.LastLogTerm, args.LastLogIdx, lastLogIdx, rf.logs))
 
 }
 
@@ -281,200 +275,126 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := rf.me == rf.leaderId
-
-	// if not leader, return false
-	if !isLeader {
-		return -1, -1, false
-	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 5.3: The leader appends the command to its log as a new entry,
-	// then issues AppendEntries RPCs in parallel to each of the
-	// other servers to replicate the entry
-	sout(rf, "leader is: %v\n"+ColorReset, rf.me)
+	index := len(rf.logs)              // the command will be appeared at this index on the leader's log
+	term := int(rf.currTerm)           // the leader current term for this command
+	isLeader := rf.raftState == Leader // if the server believes it's a leader
 
-	// TODO: is this correct?
-	// add command to log
-	term = rf.currTerm
-	index = len(rf.logs)
-	logEntry := LogEntry{Term: term, Index: index, Command: command}
-	rf.logs = append(rf.logs, logEntry)
-	sout(rf, "leader log: %v\n"+ColorReset, rf.logs)
-
-	// issue AppendEntries RPC to followers
-	// 5.3: leader must find the latest log entry where the two
-	// logs agree, delete any entries in the follower’s log after
-	// that point, and send the follower all of the leader’s entries
-	// after that point
-	numConsistent := 1
-	for idx, peer := range rf.peers {
-		if idx == rf.me {
-			continue
-		}
-		i := idx
-		peer := peer
-		go func() {
-			success := false
-			for success == false {
-				prevLogTerm := -1
-				if rf.nextIndex[i]-1 > 0 {
-					// prevLogTerm exist
-					prevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
-				}
-				args := AppendEntriesArg{
-					Term:         term,
-					LeaderId:     rf.me,
-					Entries:      rf.logs[rf.nextIndex[i]:],
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  prevLogTerm,
-					LeaderCommit: rf.commitIndex,
-				}
-				sout(rf, "send to %v: PrevLogIndex: %v, PrevLogTerm: %v\n", i, args.PrevLogIndex, args.PrevLogTerm)
-				reply := AppendEntriesReply{}
-				ok := peer.Call("Raft.AppendEntries", &args, &reply)
-				if !ok {
-					sout(rf, "unable to reach %v\n", i)
-					return
-				}
-				if reply.Success {
-					numConsistent++
-					success = true
-					sout(rf, "%v now consistent\n", i)
-					rf.nextIndex[i] = index + 1
-					if numConsistent*2 > len(rf.peers) {
-						// majority consistent
-						//if rf.commitIndex == index {
-						//	return
-						//}
-						sout(rf, "majority consistent, should update commit up to this point\n")
-						sout(rf, "commit idx: %v, index: %v\n", rf.commitIndex, index)
-						for nextCommit := rf.commitIndex + 1; nextCommit < index+1; nextCommit++ {
-							sout(rf, "committing log index %v\n", nextCommit)
-							applyMsg := ApplyMsg{
-								CommandValid: true,
-								Command:      rf.logs[nextCommit].Command,
-								CommandIndex: rf.logs[nextCommit].Index,
-							}
-							rf.applyCh <- applyMsg
-							sout(rf, "---leader applied log index [%v]: %v---\n", nextCommit, applyMsg)
-						}
-						rf.commitIndex = index
-						//applyMsg := ApplyMsg{
-						//	CommandValid: true,
-						//	Command:      command,
-						//	CommandIndex: index,
-						//}
-						//rf.applyCh <- applyMsg
-						//sout(rf, "---leader applied log: %v---\n", applyMsg)
-					}
-				} else {
-					if reply.Term > rf.currTerm {
-						// discover server with higher term number
-						rf.raftState = Follower
-						return
-					}
-					sout(rf, "send log fail to: %v\n", i)
-					rf.nextIndex[i] -= 1
-				}
-			}
-		}()
+	// Your code here (2B).
+	if !isLeader {
+		return index, term, isLeader
 	}
 
-	sout(rf, "start end\n")
+	// append the command to my log
+	rf.cond.L.Lock()
+	rf.logs = append(rf.logs, LogEntry{
+		Term:    term,
+		Command: command,
+	})
+	rf.logger.Log(LogTopicStartCmd, fmt.Sprintf("I appended the command to my log; logs=%+v", rf.logs))
+	rf.cond.L.Unlock()
+
+	// notify go routines to sync the logs
+	rf.cond.Broadcast()
+
 	return index, term, isLeader
 }
 
 type AppendEntriesArg struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
+	Term         int        // leader's term
+	LeaderId     int        // leader's id so that followers can redirect them
+	PrevLogIndex int        // index of previous log entry preceeding the new one
+	PrevLogTerm  int        // term of PrevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for HB, more than one for logs)
+	LeaderCommit int        // leader's commitIndex
 }
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term    int  // currTerm, for leader to update itself
+	Success bool // true if the follower contined the prevLogIndex and preLogTerm
 }
 
-// HeartBeat reset the timer if it is called by the leader
+// AppendEntries called by the leader either to send a HB or a log entry
 func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// if the leader's term lower than mine, I reject the the HB
 	if args.Term < rf.currTerm {
-		sout(rf, "%v - args.term: %v, currTerm: %v\n", rf.me, args.Term, rf.currTerm)
-		sout(rf, "%v logs: %v\n", rf.me, rf.logs)
+		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is lower than mine(%d), rejected its call", args.LeaderId, args.Term, rf.currTerm))
 		reply.Term = rf.currTerm
 		reply.Success = false
 		return
 	}
 
+	// the leader has a higher term, I update my term and turn into a follower
+	if args.Term > rf.currTerm {
+		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is higher than me(%d), leaderId=%d; changed to a follower and updated my term", args.LeaderId, args.Term, rf.currTerm, args.LeaderId))
+		rf.raftState = Follower
+		rf.currTerm = args.Term
+	}
+
+	// reset my HB variable and set the leader id for this term
 	rf.heartbeat = true
-	rf.raftState = Follower
 	rf.leaderId = args.LeaderId
-	rf.currTerm = args.Term
 
-	if len(args.Entries) != 0 {
-		sout(rf, "%v before commit idx: %v, leadercommit: %v", rf.me, rf.commitIndex, args.LeaderCommit)
-	}
-	if args.LeaderCommit > rf.commitIndex {
-		uptodate := len(rf.logs) > args.LeaderCommit
-		if uptodate {
-			sout(rf, "%v should update commit - cidx:[%v] lcmt:[%v]\n", rf.me, rf.commitIndex, args.LeaderCommit)
-			for nextCommit := rf.commitIndex + 1; nextCommit < args.LeaderCommit+1; nextCommit++ {
-				sout(rf, "nextCommit: %v\n", nextCommit)
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.logs[nextCommit].Command,
-					CommandIndex: rf.logs[nextCommit].Index,
-				}
-				rf.applyCh <- applyMsg
-				sout(rf, "---%v sent apply msg: [%v]---\n", rf.me, applyMsg)
-			}
-			rf.commitIndex = args.LeaderCommit
-			sout(rf, "%v update commit finish\n", rf.me)
-		}
-	}
+	// I reject the call either:
+	//   1- my log doesn't have the prevLogIndex or
+	//   2- if it does have the prevLogIndex, the term in my log is different
+	if !(args.PrevLogIndex < len(rf.logs)) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currTerm
+		reply.Success = false
 
-	// is heartbeat, no need to check logs
-	if len(args.Entries) == 0 {
+		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("REJECTED S%d append entry due to log inconsistencies; currTerm=%d, entries=%v, args.PrevLogIndex=%d, args.PrevLogTerm=%d, lastLogIndex=%d, my_log=%+v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, len(rf.logs)-1, rf.logs))
+
 		return
 	}
-	sout(rf, "%v: x\n", rf.me)
-	sout(rf, "prev log idx: %v\n", args.PrevLogIndex)
-	// TODO: check for log inconsistency
-	// if log at PrevLogIndex doesn't match, return false
-	if len(rf.logs) > 1 && args.PrevLogIndex > 0 {
-		if len(rf.logs) < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-			sout(rf, "%v AppendEntries fail\n", rf.me)
-			sout(rf, "%v logs: %v\n", rf.me, rf.logs)
-			sout(rf, "%v previdx: %v, prevterm: %v", rf.me, args.PrevLogIndex, args.PrevLogTerm)
-			reply.Success = false
-			return
+	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d, logs=%+v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, rf.logs))
+
+	// check if I have the new entry in my log:
+	//	1- if I have it, it has to have the same term as mine
+	//	2- if I have it, but it has a different term, I'll truncate my log and update it with the leader's entry
+	nextIndex := args.PrevLogIndex + 1
+	if nextIndex < len(rf.logs) {
+		if rf.logs[nextIndex].Term != args.Term {
+			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("TRUNCATE my log because current index doesn't have the same term as S%d; args.Term=%d, currTerm=%d, currentLogEntry=%+v, logs=%+v", args.LeaderId, args.Term, rf.currTerm, rf.logs[nextIndex], rf.logs))
+			rf.logs = rf.logs[:nextIndex]
+		} else {
+			rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Leader (S%d) and I (S%d) share the same prev and current log entry, currTerm=%d, logs=%v", args.LeaderId, rf.me, rf.currTerm, rf.logs))
 		}
 	}
-	sout(rf, "%v log before: %v\n", rf.me, rf.logs)
-	// remove all logs after PrevLogIndex
-	if args.PrevLogIndex > 0 {
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
+
+	if len(args.Entries) > 0 {
+		// append the new entries
+		rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("APPENDING the entry (%v) to my log; currTerm=%d, log=%+v", args.Entries, rf.currTerm, rf.logs))
+		rf.logs = append(rf.logs, args.Entries...)
 	}
-	rf.logs = append(rf.logs, args.Entries...)
-	//if args.LeaderCommit > rf.commitIndex {
-	//	if args.LeaderCommit > args.PrevLogIndex+len(args.Entries) {
-	//		rf.commitIndex = args.LeaderCommit
-	//	} else {
-	//		rf.commitIndex = args.PrevLogIndex + len(args.Entries)
-	//	}
-	//}
+
+	// if the leader is ahead of me; commit all the entries we haven't commited yet
+	if args.LeaderCommit > rf.commitIndex {
+		rf.logger.Log(LogTopicUpdateCommitIdxApe, fmt.Sprintf("The leaderCommit(%d) is greater than mine(%d), lastLogIndex=%d! updated mine to the minimum(leaderCommit, my_last_log_idx), term=%v", args.LeaderCommit, rf.commitIndex, len(rf.logs)-1, rf.currTerm))
+		rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
+	}
+
+	reply.Term = rf.currTerm
 	reply.Success = true
-	sout(rf, "%v log after: %v\n", rf.me, rf.logs)
-	sout(rf, "%v after commit idx: %v, leadercommit: %v", rf.me, rf.commitIndex, args.LeaderCommit)
+
+	if rf.lastApplied+1 <= rf.commitIndex {
+		rf.logger.Log(LogTopicCommittingEntriesApe, fmt.Sprintf("There are entries to be applied to SM from S%d term=%d, from=%d to=%d; leaderCommit=%d, lastApplied=%d", rf.leaderId, rf.currTerm, rf.lastApplied+1, rf.commitIndex, args.LeaderCommit, rf.lastApplied))
+
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i].Command,
+				CommandIndex: i,
+			}
+		}
+		rf.lastApplied = rf.commitIndex
+	} else {
+		rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("My log is up-to-date; nothing commited; leaderCommit=%d, commitIndex=%d, lastApplied=%d, my_log=%+v", args.LeaderCommit, rf.commitIndex, rf.lastApplied, rf.logs))
+	}
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -496,144 +416,25 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) startSendingHB() {
-
-	// check if I'm still the leader before sending HBs
-	for !rf.killed() && rf.raftState == Leader {
-		rf.mu.Lock()
-		currTerm := rf.currTerm
-		leaderId := rf.me
-		rf.mu.Unlock()
-		for i := range rf.peers {
-			if i != rf.me {
-				go func(i int) {
-					args := &AppendEntriesArg{
-						Term:         currTerm,
-						LeaderId:     leaderId,
-						LeaderCommit: rf.commitIndex,
-					}
-					reply := &AppendEntriesReply{}
-					ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
-
-					rf.mu.Lock()
-					if ok && reply.Term > rf.currTerm {
-						rf.raftState = Follower
-						rf.currTerm = reply.Term
-					}
-					rf.mu.Unlock()
-				}(i)
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// startEelction starts an election
-func (rf *Raft) startElection() {
-	// starting a new election
-	rf.mu.Lock()
-
-	// only Followers and Candidates can start elections
-	// skip if I'm a leader - might happen when there was timeout from previous elections or another leader is selected
-	if rf.raftState == Leader {
-		rf.mu.Unlock()
-		return
-	}
-
-	// 0. transition to the Candidate state
-	rf.raftState = Candidate
-
-	// 1. increment my term
-	rf.currTerm += 1
-
-	// 2. vote for myself
-	rf.votedFor = rf.me
-
-	// 3. ask others to vote for me as well
-	args := &RequestVoteArgs{}
-	args.Term = rf.currTerm
-	args.CandId = rf.me
-	args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
-	args.LastLogIdx = rf.logs[len(rf.logs)-1].Index
-
-	rf.mu.Unlock()
-
-	// should ask the peers in parallel for their vote;
-	// so we'll wait on this channel after sending the requests in parallel
-	voteCh := make(chan bool)
-
-	gotVotes := 1                   // gotVotes counts granted votes for me in this round of election; counted my vote already
-	majority := len(rf.peers)/2 + 1 // majority is the threshold for winning the current election
-	recVotes := 1                   // recVotes counts all peers voted (mine counted); in case we haven't reached a majority of votes
-
-	// asking peers to vote until
-	// 1. I win!
-	// 2. someone else wins!
-	// 3. another timeout happens
-	for i := 0; i < len(rf.peers); i += 1 {
-		// skip asking myself - already voted
-		if i != rf.me {
-			go func(i int) {
-				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(i, args, reply)
-				voteCh <- ok && reply.VoteGranted
-			}(i)
-		}
-	}
-
-	// let's count the votes
-	for gotVotes < majority && recVotes < len(rf.peers) {
-		if <-voteCh {
-			gotVotes += 1
-		}
-		recVotes += 1
-	}
-
-	// counting ended; let's see the results
-	// 1. let's check if there's another server who has already been elected
-	rf.mu.Lock()
-	if rf.raftState != Candidate {
-		// I'm not a Candidate anymore; we're done with counting
-		rf.mu.Unlock()
-		return
-	}
-	rf.mu.Unlock()
-
-	// Did I get the majority of votes?
-	if gotVotes >= majority {
-		// change state to Leader
-		rf.mu.Lock()
-		rf.raftState = Leader
-		rf.leaderId = rf.me
-		for range rf.peers {
-			rf.nextIndex = append(rf.nextIndex, len(rf.logs))
-			rf.matchIndex = append(rf.matchIndex, 0)
-		}
-		rf.mu.Unlock()
-
-		// start sending HBs
-		go rf.startSendingHB()
-	}
-}
-
 func (rf *Raft) ticker() {
 	var ms int64
-
 	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-		// avoid the first vote split in the first round of election
-		ms = 350 + (rand.Int63() % 150)
+		// avoids the cold start vote split situation
+		ms = 250 + (rand.Int63() % 250)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		// check if we got a heartbeat from the leader
 		// if we haven't recieved any hearts; start an election
-		if !rf.heartbeat {
+		rf.mu.Lock()
+		if !rf.heartbeat && !rf.killed() {
 			go rf.startElection()
 		}
 		// reset the heartbeat
 		rf.heartbeat = false
+		rf.mu.Unlock()
 
 	}
 }
@@ -649,25 +450,42 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	logger, err := NewLogger(me)
+	if err != nil {
+		fmt.Println("Couldn't open the log file", err)
+
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf := &Raft{
-		mu:          sync.Mutex{},
-		peers:       peers,
-		persister:   persister,
-		me:          me,
-		dead:        0,
-		leaderId:    -1,
-		raftState:   Follower,
-		currTerm:    0,
-		votedFor:    -1,
-		heartbeat:   false,
+		mu:        sync.Mutex{},
+		lock:      sync.Mutex{},
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		dead:      0,
+		logger:    logger,
+		raftState: Follower,
+		currTerm:  0,
+		votedFor:  -1,
+		heartbeat: false,
+		logs: []LogEntry{{
+			0,
+			0,
+		}},
 		commitIndex: 0,
+		lastApplied: 0,
+		leaderId:    -1,
+		nextIndex:   make([]int, len(peers)),
+		matchIndex:  make([]int, len(peers)),
 		applyCh:     applyCh,
-		color:       colors[me%6],
 	}
-	placeholderLog := LogEntry{Index: -1}
-	rf.logs = append(rf.logs, placeholderLog)
+	rf.cond = sync.NewCond(&rf.lock)
+
+	// initialize nextIndex for each server; it has to be 1 at the beginning as it is the next log entry to be sent to them
+	for pid := range peers {
+		rf.nextIndex[pid] = 1
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
