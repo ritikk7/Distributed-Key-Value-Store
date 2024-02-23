@@ -20,13 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"cpsc416/labgob"
+	"cpsc416/labgob"
 	"cpsc416/labrpc"
 )
 
@@ -129,6 +130,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.currTerm) != nil ||
+		e.Encode(rf.votedFor) != nil || e.Encode(rf.logs) != nil {
+		panic("failed to encode raft persistent state")
+	}
+	data := w.Bytes()
+	rf.persister.Save(data, nil)
 }
 
 // restore previously persisted state.
@@ -149,6 +158,12 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currTerm) != nil ||
+		d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logs) != nil {
+		panic("failed to decode raft persistent state")
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -200,6 +215,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currTerm = args.Term
 		rf.raftState = Follower
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	// the candidate's get the vote if:
@@ -219,6 +235,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE GRANTED: S%d log is more up-to-date; rf.votedFor=%d args.CandId=%d, rf.logs[%d].Term=%d < args.LastLogTerm(%d), args.LastLogIdx(%d) >= lastLogIdx(%d), my_logs=%+v ", args.CandId, args.CandId, args.CandId, lastLogIdx, rf.logs[lastLogIdx].Term, args.LastLogTerm, args.LastLogIdx, lastLogIdx, rf.logs))
 
 		rf.votedFor = args.CandId
+		rf.persist()
 
 		reply.VoteGranted = true
 		reply.Term = rf.currTerm
@@ -293,6 +310,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	})
+	rf.persist()
 	rf.logger.Log(LogTopicStartCmd, fmt.Sprintf("I appended the command to my log; logs=%+v", rf.logs))
 	rf.cond.L.Unlock()
 
@@ -333,6 +351,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is higher than me(%d), leaderId=%d; changed to a follower and updated my term", args.LeaderId, args.Term, rf.currTerm, args.LeaderId))
 		rf.raftState = Follower
 		rf.currTerm = args.Term
+		rf.persist()
 	}
 
 	// reset my HB variable and set the leader id for this term
@@ -360,6 +379,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		if rf.logs[nextIndex].Term != args.Term {
 			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("TRUNCATE my log because current index doesn't have the same term as S%d; args.Term=%d, currTerm=%d, currentLogEntry=%+v, logs=%+v", args.LeaderId, args.Term, rf.currTerm, rf.logs[nextIndex], rf.logs))
 			rf.logs = rf.logs[:nextIndex]
+			rf.persist()
 		} else {
 			rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Leader (S%d) and I (S%d) share the same prev and current log entry, currTerm=%d, logs=%v", args.LeaderId, rf.me, rf.currTerm, rf.logs))
 		}
@@ -369,6 +389,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		// append the new entries
 		rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("APPENDING the entry (%v) to my log; currTerm=%d, log=%+v", args.Entries, rf.currTerm, rf.logs))
 		rf.logs = append(rf.logs, args.Entries...)
+		rf.persist()
 	}
 
 	// if the leader is ahead of me; commit all the entries we haven't commited yet
