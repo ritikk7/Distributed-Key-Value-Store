@@ -375,11 +375,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 
 		return
 	}
-
-	//if len(rf.logs)-1 > args.PrevLogIndex && rf.logs[len(rf.logs-1)].Term == args.Entries {
-	//
-	//}
-
+	
 	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d, logs=%+v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, rf.logs))
 
 	// check if I have the new entry in my log:
