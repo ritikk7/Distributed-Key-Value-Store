@@ -337,13 +337,18 @@ type AppendEntriesArg struct {
 type AppendEntriesReply struct {
 	Term    int  // currTerm, for leader to update itself
 	Success bool // true if the follower contined the prevLogIndex and preLogTerm
+	XTerm   int  // term in the conflicting entry (if any)
+	XIndex  int  // index of first entry with that term (if any)
+	XLen    int  // log length
 }
 
 // AppendEntries called by the leader either to send a HB or a log entry
 func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.XLen = -1
 	// if the leader's term lower than mine, I reject the the HB
 	if args.Term < rf.currTerm {
 		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is lower than mine(%d), rejected its call", args.LeaderId, args.Term, rf.currTerm))
@@ -370,12 +375,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	if !(args.PrevLogIndex < len(rf.logs)) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currTerm
 		reply.Success = false
-
+		reply.XLen = len(rf.logs)
+		if args.PrevLogIndex < len(rf.logs) {
+			reply.XTerm = rf.logs[args.PrevLogIndex].Term
+			for i, log := range rf.logs {
+				if log.Term == rf.logs[args.PrevLogIndex].Term {
+					reply.XIndex = i
+					break
+				}
+			}
+		}
 		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("REJECTED S%d append entry due to log inconsistencies; currTerm=%d, entries=%v, args.PrevLogIndex=%d, args.PrevLogTerm=%d, lastLogIndex=%d, my_log=%+v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, len(rf.logs)-1, rf.logs))
 
 		return
 	}
-	
+
 	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d, logs=%+v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, rf.logs))
 
 	// check if I have the new entry in my log:

@@ -94,7 +94,28 @@ func (rf *Raft) syncLogEntries(pId int, term int) {
 			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("S%d appended the log entry; nextIndex[%d]=%d, matchIndex[%d]=%d, myLastLogIndex=%d", pId, pId, rf.nextIndex[pId], pId, rf.matchIndex[pId], len(rf.logs)-1))
 		} else {
 			// the follower rejected the entry; try another one
-			rf.nextIndex[pId] -= 1
+			if reply.XTerm != -1 {
+				foundXTerm := false
+				for i := len(rf.logs) - 1; i > 0; i-- {
+					if rf.logs[i].Term < reply.XTerm {
+						break
+					}
+					if rf.logs[i].Term == reply.XTerm {
+						rf.nextIndex[pId] = i
+						foundXTerm = true
+						break
+					}
+				}
+				if !foundXTerm {
+					// leader doesn't have XTerm
+					rf.nextIndex[pId] = reply.XIndex
+				}
+			} else if args.PrevLogIndex >= reply.XLen {
+				// follower's log is too short
+				rf.nextIndex[pId] = reply.XLen
+			} else {
+				rf.nextIndex[pId] -= 1
+			}
 			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("S%d rejected the log entry; nextIndex[%d]=%d, myLastLogIndex=%d", pId, pId, rf.nextIndex[pId], len(rf.logs)-1))
 		}
 		rf.mu.Unlock()
