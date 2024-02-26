@@ -160,9 +160,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&rf.currTerm) != nil ||
-		d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logs) != nil {
+	var currTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currTerm) != nil ||
+		d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
 		panic("failed to decode raft persistent state")
+	} else {
+		rf.currTerm = currTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
 	}
 }
 
@@ -368,11 +375,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 
 		return
 	}
+
+	//if len(rf.logs)-1 > args.PrevLogIndex && rf.logs[len(rf.logs-1)].Term == args.Entries {
+	//
+	//}
+
 	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d, logs=%+v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, rf.logs))
 
 	// check if I have the new entry in my log:
 	//	1- if I have it, it has to have the same term as mine
 	//	2- if I have it, but it has a different term, I'll truncate my log and update it with the leader's entry
+	needToAppend := true
 	nextIndex := args.PrevLogIndex + 1
 	if nextIndex < len(rf.logs) {
 		if rf.logs[nextIndex].Term != args.Term {
@@ -380,11 +393,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 			rf.logs = rf.logs[:nextIndex]
 			rf.persist()
 		} else {
-			rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Leader (S%d) and I (S%d) share the same prev and current log entry, currTerm=%d, logs=%v", args.LeaderId, rf.me, rf.currTerm, rf.logs))
+			rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Leader (S%d) and I (S%d) share the same prev and current log entry, currTerm=%d, logs=%v; don't need to append anything", args.LeaderId, rf.me, rf.currTerm, rf.logs))
+			needToAppend = false
 		}
 	}
 
-	if len(args.Entries) > 0 {
+	if len(args.Entries) > 0 && needToAppend {
 		// append the new entries
 		rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("APPENDING the entry (%v) to my log; currTerm=%d, log=%+v", args.Entries, rf.currTerm, rf.logs))
 		rf.logs = append(rf.logs, args.Entries...)
