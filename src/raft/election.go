@@ -15,15 +15,14 @@ func (rf *Raft) startSendingHB() {
 		}
 		currTerm := rf.currTerm
 		leaderCommitIdx := rf.commitIndex
+		nextIdx := len(rf.logs)
+		prevLogIdx := nextIdx - 1
+		prevLogTerm := rf.logs[prevLogIdx].Term
+		rf.mu.Unlock()
 
 		for pId := range rf.peers {
-			nextIdx := rf.nextIndex[pId]
-			prevLogIdx := nextIdx - 1
-			prevLogTerm := rf.logs[prevLogIdx].Term
-
 			go rf.sendHB(pId, prevLogIdx, prevLogTerm, leaderCommitIdx, currTerm)
 		}
-		rf.mu.Unlock()
 
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -49,25 +48,25 @@ func (rf *Raft) sendHB(pId, prevLogIdx, prevLogTerm, leaderCommitIdx, currTerm i
 
 	ok := rf.peers[pId].Call(APPEND_ENTRIES_RPC, &args, &reply)
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if ok {
-		if rf.raftState != Leader {
+		rf.mu.Lock()
+		if rf.raftState != Leader || currTerm != reply.Term {
+			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("(RETURN) HB rejected from S%d; either I'm not a leader or got an old reply. state=%d, sentTerm=%d, replyTerm=%d, rf.currTerm=%d", pId, rf.raftState, currTerm, reply.Term, rf.currTerm))
+			rf.mu.Unlock()
 			return
-		} else if rf.currTerm < reply.Term {
-			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("Got a reply sent during term=%d from S%d which has a higher term %d than currentTerm=%d; turn to a follower ...", currTerm, pId, reply.Term, rf.currTerm))
+		}
+		if rf.currTerm < reply.Term {
+			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("(RETURN) HB sent in term=%d to S%d has a higher term %d than mine=%d; turn to a follower ...", currTerm, pId, reply.Term, rf.currTerm))
 			rf.raftState = Follower
 			rf.currTerm = reply.Term
-			return
-		}
+			rf.persist()
 
-		if reply.Term > currTerm {
-			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("HB was rejected by S%d because it was sent during term=%d but the reply has a higher term =%d", pId, currTerm, reply.Term))
+			rf.mu.Unlock()
 			return
 		}
-	} else {
-		rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("failed to call S%d during term=%d", pId, currTerm))
+		rf.mu.Unlock()
+
+		rf.cond.Broadcast()
 	}
 }
 
@@ -89,9 +88,11 @@ func (rf *Raft) startElection() {
 
 	// 1. increment my term
 	rf.currTerm += 1
+	rf.persist()
 
 	// 2. vote for myself
 	rf.votedFor = rf.me
+	rf.persist()
 
 	// 3. ask others to vote for me as well
 	args := &RequestVoteArgs{
@@ -125,9 +126,6 @@ func (rf *Raft) startElection() {
 			go func(i int) {
 				reply := &RequestVoteReply{}
 				ok := rf.peers[i].Call(REQUEST_VOTE_RPC, args, reply)
-				if !ok {
-					rf.logger.Log(LogTopicElection, fmt.Sprintf("S%d couldn't be reached for a vote term=%d", i, args.Term))
-				}
 
 				// make sure we don't get old responses
 				voteCh <- ok && reply.VoteGranted && reply.Term == args.Term
@@ -165,9 +163,9 @@ func (rf *Raft) startElection() {
 		// reset my nextIndex and matchIndex after election
 		// nextIndex intialiazed to the last entry's index in the leader's logs
 		rf.cond.L.Lock()
-		lastLogIndex := len(rf.logs)
+		logLen := len(rf.logs)
 		for i := range rf.peers {
-			rf.nextIndex[i] = lastLogIndex
+			rf.nextIndex[i] = logLen
 			rf.matchIndex[i] = 0
 		}
 		rf.cond.L.Unlock()

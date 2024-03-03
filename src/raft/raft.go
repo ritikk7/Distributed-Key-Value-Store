@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	//	"cpsc416/labgob"
 	"cpsc416/labgob"
 	"cpsc416/labrpc"
 )
@@ -130,14 +131,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	if e.Encode(rf.currTerm) != nil ||
-		e.Encode(rf.votedFor) != nil || e.Encode(rf.logs) != nil {
-		panic("failed to encode raft persistent state")
-	}
-	data := w.Bytes()
-	rf.persister.Save(data, nil)
+
+	// rf.mu.Lock()
+	e.Encode(rf.currTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	// rf.mu.Unlock()
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -158,19 +163,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currTerm int
-	var votedFor int
+
+	var currTerm, votedFor int
 	var logs []LogEntry
-	if d.Decode(&currTerm) != nil ||
-		d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
-		panic("failed to decode raft persistent state")
-	} else {
-		rf.currTerm = currTerm
-		rf.votedFor = votedFor
-		rf.logs = logs
+
+	if d.Decode(&currTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+		fmt.Println("COULDN'T DECODE THE STATE")
 	}
+	// rf.mu.Lock()
+	rf.currTerm = currTerm
+	rf.votedFor = votedFor
+	rf.logs = append([]LogEntry{}, logs...)
+	// rf.mu.Unlock()
 }
 
 // the service says it has created a snapshot that has
@@ -179,6 +186,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+
 }
 
 // example RequestVote RPC arguments structure.
@@ -206,7 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// if the candidate's term is smaller than mine, I reject the vote
 	if args.Term < rf.currTerm {
-		rf.logger.Log(LogTopicElection, fmt.Sprintf("S%d asked for a vote; args.Term(%d) is lower than mine (%d); rejecting to vote", args.CandId, args.Term, rf.currTerm))
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE REJECTED: S%d asked for a vote but has a lower term! (args.Term=%d rf.currTerm=%d)", args.CandId, args.Term, rf.currTerm))
 		reply.VoteGranted = false
 		reply.Term = rf.currTerm
 		return
@@ -217,9 +225,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 		2- turn into a follower
 	//		3- reset my vote
 	if args.Term > rf.currTerm {
-		rf.logger.Log(LogTopicElection, fmt.Sprintf("S%d term (%d) is higher than me (%d); turn into a follower with term=%d", args.CandId, args.Term, rf.currTerm, args.Term))
-		rf.currTerm = args.Term
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTING: turnning to a follower because S%d has a higher than me! (args.Term=%d, rf.currTerm=%d)", args.CandId, args.Term, rf.currTerm))
 		rf.raftState = Follower
+		rf.currTerm = args.Term
 		rf.votedFor = -1
 		rf.persist()
 	}
@@ -237,8 +245,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//	1- my last log entry has a lower term than the candidate's last log term; or
 	//	2- if the last log terms matches betweem mine and the candidate, if the candidate has a longer log
 	lastLogIdx := len(rf.logs) - 1
-	if rf.logs[lastLogIdx].Term < args.LastLogTerm || (rf.logs[lastLogIdx].Term == args.LastLogTerm && args.LastLogIdx >= lastLogIdx) {
-		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE GRANTED: S%d log is more up-to-date; rf.votedFor=%d args.CandId=%d, rf.logs[%d].Term=%d < args.LastLogTerm(%d), args.LastLogIdx(%d) >= lastLogIdx(%d), my_logs=%+v ", args.CandId, args.CandId, args.CandId, lastLogIdx, rf.logs[lastLogIdx].Term, args.LastLogTerm, args.LastLogIdx, lastLogIdx, rf.logs))
+	if rf.logs[lastLogIdx].Term < args.LastLogTerm {
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE GRANTED! S%d's last entry has a higher term than me! (args.Term=%d, rf.currTerm=%d) (rf.logs[lastLogIdx].Term=%d, args.LastLogTerm=%d)\n\tlogs=%v", args.CandId, args.Term, rf.currTerm, rf.logs[lastLogIdx].Term, args.LastLogTerm, rf.logs))
+
+		rf.votedFor = args.CandId
+		rf.persist()
+
+		reply.VoteGranted = true
+		reply.Term = rf.currTerm
+
+		return
+	} else if rf.logs[lastLogIdx].Term == args.LastLogTerm && args.LastLogIdx >= lastLogIdx {
+		rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE GRANTED! S%d's log is >= than me; (args.Term=%d, rf.currTerm=%d) (args.LastLogIdx=%d, lastLogIdx=%d)\n\tlogs=%v", args.CandId, args.Term, rf.currTerm, args.LastLogIdx, lastLogIdx, rf.logs))
 
 		rf.votedFor = args.CandId
 		rf.persist()
@@ -249,8 +267,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE REJECTED; my log is more up-to-date than S%d; rf.votedFor=%d args.CandId=%d, rf.logs[%d].Term=%d < args.LastLogTerm(%d), args.LastLogIdx(%d) >= lastLogIdx(%d), my_logs=%+v ", args.CandId, rf.votedFor, args.CandId, lastLogIdx, rf.logs[lastLogIdx].Term, args.LastLogTerm, args.LastLogIdx, lastLogIdx, rf.logs))
+	rf.logger.Log(LogTopicElection, fmt.Sprintf("VOTE REJECTED! my log is more up-to-date than S%d! (args.Term=%d, rf.currTerm=%d) (rf.votedFor=%d) (args.LastLogIndex=%d, args.LastLogTerm=%d)\n\tlog=%v", args.CandId, args.Term, rf.currTerm, rf.votedFor, args.LastLogIdx, args.LastLogTerm, rf.logs))
 
+	reply.Term = rf.currTerm
+	reply.VoteGranted = false
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -317,7 +337,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persist()
-	rf.logger.Log(LogTopicStartCmd, fmt.Sprintf("I appended the command to my log; logs=%+v", rf.logs))
+
+	rf.logger.Log(LogTopicStartCmd, fmt.Sprintf("Added the new command to my log!\n\tcommand=%v\n\tlog=%v", command, rf.logs))
 	rf.cond.L.Unlock()
 
 	// notify go routines to sync the logs
@@ -335,23 +356,43 @@ type AppendEntriesArg struct {
 	LeaderCommit int        // leader's commitIndex
 }
 type AppendEntriesReply struct {
-	Term    int  // currTerm, for leader to update itself
-	Success bool // true if the follower contined the prevLogIndex and preLogTerm
-	XTerm   int  // term in the conflicting entry (if any)
-	XIndex  int  // index of first entry with that term (if any)
-	XLen    int  // log length
+	XIsShort bool // if the follower's log is shorter
+	XLen     int  // the length of the follower's log
+	XTerm    int  // the conflicting term in the follower's log
+	XIndex   int  // the index of the first entry of XTerm
+	Term     int  // currTerm, for leader to update itself
+	Success  bool // true if the follower contined the prevLogIndex and preLogTerm
+}
+
+// fillReplyX finds the term and its first index in the log for the follower!
+// Optimizations required for Lab2C
+// Follower:
+//
+//	XTerm:  term in the conflicting entry (if any)
+//	XIndex: index of first entry with that term (if any)
+//	XLen:   log length
+func (rf *Raft) fillReplyX(reply *AppendEntriesReply, mismatchIdx int, isShorter bool) {
+	reply.XIsShort = isShorter
+	reply.XLen = len(rf.logs)
+
+	reply.XIndex = mismatchIdx
+	reply.XTerm = rf.logs[reply.XIndex].Term
+
+	// find the index where we don't have XTerm
+	for reply.XIndex >= 0 && rf.logs[reply.XIndex].Term == reply.XTerm {
+		reply.XIndex -= 1
+	}
+	reply.XIndex += 1
 }
 
 // AppendEntries called by the leader either to send a HB or a log entry
 func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.XTerm = -1
-	reply.XIndex = -1
-	reply.XLen = -1
+
 	// if the leader's term lower than mine, I reject the the HB
 	if args.Term < rf.currTerm {
-		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is lower than mine(%d), rejected its call", args.LeaderId, args.Term, rf.currTerm))
+		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("APE REJECTED: S%d claims to be the leader but has a lower term! (args.Term=%d rf.currTerm=%d)", args.LeaderId, args.Term, rf.currTerm))
 		reply.Term = rf.currTerm
 		reply.Success = false
 		return
@@ -359,7 +400,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 
 	// the leader has a higher term, I update my term and turn into a follower
 	if args.Term > rf.currTerm {
-		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d claims to be the leader; args.Term(%d) is higher than me(%d), leaderId=%d; changed to a follower and updated my term", args.LeaderId, args.Term, rf.currTerm, args.LeaderId))
+		rf.logger.Log(LogTopicAppendEntryRpc, fmt.Sprintf("S%d is the leader with higher term! Turning to a follower. (args.Term=%d rf.currTerm=%d) (leader=S%d)", args.LeaderId, args.Term, rf.currTerm, args.LeaderId))
 		rf.raftState = Follower
 		rf.currTerm = args.Term
 		rf.persist()
@@ -372,52 +413,63 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	// I reject the call either:
 	//   1- my log doesn't have the prevLogIndex or
 	//   2- if it does have the prevLogIndex, the term in my log is different
-	if !(args.PrevLogIndex < len(rf.logs)) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if !(args.PrevLogIndex < len(rf.logs)) {
 		reply.Term = rf.currTerm
 		reply.Success = false
-		reply.XLen = len(rf.logs)
-		if args.PrevLogIndex < len(rf.logs) {
-			reply.XTerm = rf.logs[args.PrevLogIndex].Term
-			for i, log := range rf.logs {
-				if log.Term == rf.logs[args.PrevLogIndex].Term {
-					reply.XIndex = i
-					break
-				}
-			}
-		}
-		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("REJECTED S%d append entry due to log inconsistencies; currTerm=%d, entries=%v, args.PrevLogIndex=%d, args.PrevLogTerm=%d, lastLogIndex=%d, my_log=%+v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, len(rf.logs)-1, rf.logs))
 
+		reply.XIsShort = true
+		reply.XLen = len(rf.logs)
+
+		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("APE REJECTED: my log is shorter than S%d's log! (currTerm=%d, entries=%v) (args.PrevLogIndex=%d, args.PrevLogTerm=%d) (reply.XLen=%d, reply.XIndex=%d, reply.XTerm=%d) (lastLogIndex=%d)\n\tlog=%v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, reply.XLen, reply.XIndex, reply.Term, len(rf.logs)-1, rf.logs))
+		return
+	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currTerm
+		reply.Success = false
+
+		rf.fillReplyX(reply, args.PrevLogIndex, false)
+
+		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("APE REJECTED: my prev entry has a mismatched term than S%d! (currTerm=%d, entries=%v) (args.PrevLogIndex=%d, args.PrevLogTerm=%d)  (lastLogIndex=%d) (reply=%+v)\n\tlog=%v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, len(rf.logs)-1, reply, rf.logs))
 		return
 	}
 
-	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d, logs=%+v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, rf.logs))
+	rf.logger.Log(LogTopicMatchPrevApe, fmt.Sprintf("MATCHED Prev Log Entry from S%d; args.PrevLogIndex=%d, args.PrevLogTerm=%d,\n\targs.Entries=%v\n\tlogs=%v", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Entries, rf.logs))
 
-	// check if I have the new entry in my log:
-	//	1- if I have it, it has to have the same term as mine
-	//	2- if I have it, but it has a different term, I'll truncate my log and update it with the leader's entry
-	needToAppend := true
-	nextIndex := args.PrevLogIndex + 1
-	if nextIndex < len(rf.logs) {
-		if rf.logs[nextIndex].Term != args.Term {
-			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("TRUNCATE my log because current index doesn't have the same term as S%d; args.Term=%d, currTerm=%d, currentLogEntry=%+v, logs=%+v", args.LeaderId, args.Term, rf.currTerm, rf.logs[nextIndex], rf.logs))
-			rf.logs = rf.logs[:nextIndex]
+	// finding the conflicting index
+	// if it is a HB; conflictIdx is -1
+	conflictIdx := 0
+	for conflictIdx < len(args.Entries) {
+		nextIdx := args.PrevLogIndex + conflictIdx + 1 // next entry in my log
+		if nextIdx >= len(rf.logs) {
+			// my log is ended
+			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("(LOG Conflict, Leader S%d) There is no entry in my log with index=%d! setting conflictIdx=%d\n\tlog=%v", args.LeaderId, nextIdx, conflictIdx, rf.logs))
+			break
+		} else if rf.logs[nextIdx].Term != args.Entries[conflictIdx].Term {
+			// truncate the log
+			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("(LOG Conflict, Leader S%d) Index %d has a different term than args.Entries[%d]!\n\tShared up to index %d with args.Entries Truncating my log ... (rf.logs[%d].Term=%d, args.Entries[%d].Term=%d)\n\tnew_log=%v\n\tlog=%v\n\targ.Entries=%v", args.LeaderId, nextIdx, conflictIdx, nextIdx, nextIdx, rf.logs[nextIdx].Term, conflictIdx, args.Entries[conflictIdx].Term, rf.logs[:nextIdx], rf.logs, args.Entries))
+
+			rf.logs = rf.logs[:nextIdx]
 			rf.persist()
-		} else {
-			rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Leader (S%d) and I (S%d) share the same prev and current log entry, currTerm=%d, logs=%v; don't need to append anything", args.LeaderId, rf.me, rf.currTerm, rf.logs))
-			needToAppend = false
+			break
 		}
+		conflictIdx += 1
 	}
 
-	if len(args.Entries) > 0 && needToAppend {
+	// find which part of the entries have to be added
+	rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("Adding the following portion from args.Entries!\n\tnew_portion=%v\n\targs.Entries=%v", args.Entries[conflictIdx:], args.Entries))
+	args.Entries = args.Entries[conflictIdx:] // the portion of the entries we should add to the log; might be nothing
+
+	if len(args.Entries) > 0 {
 		// append the new entries
-		rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("APPENDING the entry (%v) to my log; currTerm=%d, log=%+v", args.Entries, rf.currTerm, rf.logs))
 		rf.logs = append(rf.logs, args.Entries...)
 		rf.persist()
+
+		rf.logger.Log(LogTopicAppendingEntryApe, fmt.Sprintf("Appended the entries to my log! (currTerm=%d)\n\targs.Entries=%v\n\tnew_log=%v", rf.currTerm, args.Entries, rf.logs))
 	}
 
 	// if the leader is ahead of me; commit all the entries we haven't commited yet
 	if args.LeaderCommit > rf.commitIndex {
-		rf.logger.Log(LogTopicUpdateCommitIdxApe, fmt.Sprintf("The leaderCommit(%d) is greater than mine(%d), lastLogIndex=%d! updated mine to the minimum(leaderCommit, my_last_log_idx), term=%v", args.LeaderCommit, rf.commitIndex, len(rf.logs)-1, rf.currTerm))
+		rf.logger.Log(LogTopicUpdateCommitIdxApe, fmt.Sprintf("The leaderCommit(%d) is greater than rf.commitIndex(%d)! updating mine to the minimum(leaderCommit, my_last_log_idx=%d), term=%d", args.LeaderCommit, rf.commitIndex, len(rf.logs)-1, rf.currTerm))
+
 		rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
 	}
 
@@ -425,7 +477,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	reply.Success = true
 
 	if rf.lastApplied+1 <= rf.commitIndex {
-		rf.logger.Log(LogTopicCommittingEntriesApe, fmt.Sprintf("There are entries to be applied to SM from S%d term=%d, from=%d to=%d; leaderCommit=%d, lastApplied=%d", rf.leaderId, rf.currTerm, rf.lastApplied+1, rf.commitIndex, args.LeaderCommit, rf.lastApplied))
+		rf.logger.Log(LogTopicCommittingEntriesApe, fmt.Sprintf("Uncommited Entries from Leader=S%d -> applying indexes [from=%d to=%d] to the SM\n\tlog=%v", rf.leaderId, rf.lastApplied+1, rf.commitIndex, rf.logs))
 
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.applyCh <- ApplyMsg{
@@ -436,7 +488,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		}
 		rf.lastApplied = rf.commitIndex
 	} else {
-		rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("My log is up-to-date; nothing commited; leaderCommit=%d, commitIndex=%d, lastApplied=%d, my_log=%+v", args.LeaderCommit, rf.commitIndex, rf.lastApplied, rf.logs))
+		rf.logger.Log(LogTopicLogUpdateApe, fmt.Sprintf("Nothing to commit! leaderCommit=%d, commitIndex=%d, lastApplied=%d\n\tlog=%v", args.LeaderCommit, rf.commitIndex, rf.lastApplied, rf.logs))
 	}
 
 }
@@ -453,6 +505,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.cond.Broadcast()
+
+	rf.logger.Log(LogTopicElection, fmt.Sprintln("I got killed :("))
+	time.Sleep(10 * time.Millisecond) // this is ugly; fix it for 2D
 }
 
 func (rf *Raft) killed() bool {
