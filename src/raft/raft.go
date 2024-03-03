@@ -103,6 +103,9 @@ type Raft struct {
 
 	// channel to pass results to the server
 	applyCh chan ApplyMsg
+
+	snapshot          []byte // last snapshot provided by service
+	lastSnapshotIndex int    // last index included in snapshot
 }
 
 // return currentTerm and whether this server
@@ -142,7 +145,7 @@ func (rf *Raft) persist() {
 	// rf.mu.Unlock()
 
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -186,7 +189,17 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logger.Log(LogTopicSnapshot, fmt.Sprintf("SNAPSHOT: index=%d, log_len before=%d, logs:%v\n", index, len(rf.logs)-1, rf.logs))
+	actualIdxInLog := index - rf.lastSnapshotIndex
+	lastSnapshotTerm := rf.logs[index-rf.lastSnapshotIndex].Term
+	rf.logs = append(rf.logs[:1], rf.logs[actualIdxInLog+1:]...)
+	rf.snapshot = snapshot
+	rf.lastSnapshotIndex = index
+	rf.logger.Log(LogTopicSnapshot, fmt.Sprintf("SNAPSHOT: log_len after=%d, logs:%v\n", len(rf.logs)-1, rf.logs))
+	rf.logs[0].Term = lastSnapshotTerm
+	rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -321,9 +334,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := len(rf.logs)              // the command will be appeared at this index on the leader's log
-	term := int(rf.currTerm)           // the leader current term for this command
-	isLeader := rf.raftState == Leader // if the server believes it's a leader
+	index := len(rf.logs) + rf.lastSnapshotIndex // the command will be appeared at this index on the leader's log
+	term := int(rf.currTerm)                     // the leader current term for this command
+	isLeader := rf.raftState == Leader           // if the server believes it's a leader
 
 	// Your code here (2B).
 	if !isLeader {
@@ -373,13 +386,13 @@ type AppendEntriesReply struct {
 //	XLen:   log length
 func (rf *Raft) fillReplyX(reply *AppendEntriesReply, mismatchIdx int, isShorter bool) {
 	reply.XIsShort = isShorter
-	reply.XLen = len(rf.logs)
+	reply.XLen = len(rf.logs) + rf.lastSnapshotIndex
 
 	reply.XIndex = mismatchIdx
-	reply.XTerm = rf.logs[reply.XIndex].Term
+	reply.XTerm = rf.logs[reply.XIndex-rf.lastSnapshotIndex].Term
 
 	// find the index where we don't have XTerm
-	for reply.XIndex >= 0 && rf.logs[reply.XIndex].Term == reply.XTerm {
+	for reply.XIndex >= 0 && rf.logs[reply.XIndex-rf.lastSnapshotIndex].Term == reply.XTerm {
 		reply.XIndex -= 1
 	}
 	reply.XIndex += 1
@@ -413,16 +426,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	// I reject the call either:
 	//   1- my log doesn't have the prevLogIndex or
 	//   2- if it does have the prevLogIndex, the term in my log is different
-	if !(args.PrevLogIndex < len(rf.logs)) {
+	if !(args.PrevLogIndex < len(rf.logs)+rf.lastSnapshotIndex) {
 		reply.Term = rf.currTerm
 		reply.Success = false
 
 		reply.XIsShort = true
-		reply.XLen = len(rf.logs)
+		reply.XLen = len(rf.logs) + rf.lastSnapshotIndex
 
 		rf.logger.Log(LogTopicRejectAppendEntry, fmt.Sprintf("APE REJECTED: my log is shorter than S%d's log! (currTerm=%d, entries=%v) (args.PrevLogIndex=%d, args.PrevLogTerm=%d) (reply.XLen=%d, reply.XIndex=%d, reply.XTerm=%d) (lastLogIndex=%d)\n\tlog=%v", args.LeaderId, rf.currTerm, args.Entries, args.PrevLogIndex, args.PrevLogTerm, reply.XLen, reply.XIndex, reply.Term, len(rf.logs)-1, rf.logs))
 		return
-	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	} else if rf.logs[args.PrevLogIndex-rf.lastSnapshotIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currTerm
 		reply.Success = false
 
@@ -439,15 +452,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	conflictIdx := 0
 	for conflictIdx < len(args.Entries) {
 		nextIdx := args.PrevLogIndex + conflictIdx + 1 // next entry in my log
-		if nextIdx >= len(rf.logs) {
+		if nextIdx >= len(rf.logs)+rf.lastSnapshotIndex {
 			// my log is ended
 			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("(LOG Conflict, Leader S%d) There is no entry in my log with index=%d! setting conflictIdx=%d\n\tlog=%v", args.LeaderId, nextIdx, conflictIdx, rf.logs))
 			break
-		} else if rf.logs[nextIdx].Term != args.Entries[conflictIdx].Term {
+		} else if rf.logs[nextIdx-rf.lastSnapshotIndex].Term != args.Entries[conflictIdx].Term {
 			// truncate the log
 			rf.logger.Log(LogTopicTruncateLogApe, fmt.Sprintf("(LOG Conflict, Leader S%d) Index %d has a different term than args.Entries[%d]!\n\tShared up to index %d with args.Entries Truncating my log ... (rf.logs[%d].Term=%d, args.Entries[%d].Term=%d)\n\tnew_log=%v\n\tlog=%v\n\targ.Entries=%v", args.LeaderId, nextIdx, conflictIdx, nextIdx, nextIdx, rf.logs[nextIdx].Term, conflictIdx, args.Entries[conflictIdx].Term, rf.logs[:nextIdx], rf.logs, args.Entries))
 
-			rf.logs = rf.logs[:nextIdx]
+			rf.logs = rf.logs[:nextIdx-rf.lastSnapshotIndex]
 			rf.persist()
 			break
 		}
@@ -470,7 +483,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.logger.Log(LogTopicUpdateCommitIdxApe, fmt.Sprintf("The leaderCommit(%d) is greater than rf.commitIndex(%d)! updating mine to the minimum(leaderCommit, my_last_log_idx=%d), term=%d", args.LeaderCommit, rf.commitIndex, len(rf.logs)-1, rf.currTerm))
 
-		rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
+		rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1+rf.lastSnapshotIndex)
 	}
 
 	reply.Term = rf.currTerm
@@ -482,7 +495,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.logs[i].Command,
+				Command:      rf.logs[i-rf.lastSnapshotIndex].Command,
 				CommandIndex: i,
 			}
 		}
@@ -573,12 +586,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			0,
 			0,
 		}},
-		commitIndex: 0,
-		lastApplied: 0,
-		leaderId:    -1,
-		nextIndex:   make([]int, len(peers)),
-		matchIndex:  make([]int, len(peers)),
-		applyCh:     applyCh,
+		commitIndex:       0,
+		lastApplied:       0,
+		leaderId:          -1,
+		nextIndex:         make([]int, len(peers)),
+		matchIndex:        make([]int, len(peers)),
+		applyCh:           applyCh,
+		lastSnapshotIndex: 0,
+		snapshot:          nil,
 	}
 	rf.cond = sync.NewCond(&rf.lock)
 

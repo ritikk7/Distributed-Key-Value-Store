@@ -21,7 +21,7 @@ func (rf *Raft) syncLogEntries(pId int, term int) {
 			rf.mu.Unlock()
 			return
 		}
-		logLen := len(rf.logs)
+		logLen := len(rf.logs) + rf.lastSnapshotIndex
 		rf.mu.Unlock()
 
 		rf.cond.L.Lock()
@@ -38,14 +38,14 @@ func (rf *Raft) syncLogEntries(pId int, term int) {
 			rf.mu.Unlock()
 			return
 		}
-
 		nextIdx := rf.nextIndex[pId]
-		prevLogIndex := nextIdx - 1               // index of the prev log entry on my log
-		prevLogTerm := rf.logs[prevLogIndex].Term // the term of the prev log entry
-		leaderCommit := rf.commitIndex            // the index of latest commited log entry
+		prevLogIndex := nextIdx - 1 // index of the prev log entry on my log
+		rf.logger.Log(Misc, fmt.Sprintf("prevLogIdx:%v lastSnapIdx:%v loglen:%d\n", prevLogIndex, rf.lastSnapshotIndex, len(rf.logs)-1))
+		prevLogTerm := rf.logs[prevLogIndex-rf.lastSnapshotIndex].Term // the term of the prev log entry
+		leaderCommit := rf.commitIndex                                 // the index of latest commited log entry
 		leaderId := rf.me
 
-		entries := append([]LogEntry{}, rf.logs[nextIdx:]...)
+		entries := append([]LogEntry{}, rf.logs[nextIdx-rf.lastSnapshotIndex:]...)
 
 		rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("Sending the entry to S%d; leaderCommit=%d ( prevLogIndex=%d, prevLogTerm=%d )\n\tentries=%v", pId, leaderCommit, prevLogIndex, prevLogTerm, entries))
 		rf.mu.Unlock()
@@ -170,7 +170,7 @@ func (rf *Raft) commitEntries(term int) {
 	maxMatchIdx := -1
 	majorityCount := make(map[int]int, 0)
 	for _, mIdx := range rf.matchIndex {
-		if mIdx == 0 || rf.logs[mIdx].Term != rf.currTerm {
+		if mIdx == 0 || rf.logs[mIdx-rf.lastSnapshotIndex].Term != rf.currTerm {
 			continue
 		}
 		majorityCount[mIdx] += 1
@@ -197,11 +197,11 @@ func (rf *Raft) commitEntries(term int) {
 
 	if term == rf.currTerm && rf.lastApplied < rf.commitIndex {
 		rf.logger.Log(LogTopicCommittingEntriesApe, fmt.Sprintf("Leader is applying logs [from=%d, to=%d] ..., leaderId=%d, rf.commitIndex=%d\n\tlen(logs)=%d\n\tlogs=%v", rf.lastApplied+1, rf.commitIndex, rf.leaderId, rf.commitIndex, len(rf.logs), rf.logs))
-
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			rf.logger.Log(LogTopicUpdateCommitIdxApe, fmt.Sprintf("Committing: %v\n", i))
 			rf.applyCh <- ApplyMsg{
 				CommandValid:  true,
-				Command:       rf.logs[i].Command,
+				Command:       rf.logs[i-rf.lastSnapshotIndex].Command,
 				CommandIndex:  i,
 				SnapshotValid: false,
 				Snapshot:      []byte{},
