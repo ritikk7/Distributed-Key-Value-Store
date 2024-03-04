@@ -167,16 +167,16 @@ func (rf *Raft) commitEntries(term int) {
 	}
 
 	rf.cond.L.Lock()
+	defer rf.cond.L.Unlock()
 	maxMatchIdx := -1
 	majorityCount := make(map[int]int, 0)
 	for _, mIdx := range rf.matchIndex {
-		if mIdx == 0 || rf.logs[mIdx].Term != rf.currTerm {
+		if mIdx == 0 || mIdx >= len(rf.logs) || rf.logs[mIdx].Term != rf.currTerm {
 			continue
 		}
 		majorityCount[mIdx] += 1
 		maxMatchIdx = Max(maxMatchIdx, mIdx)
 	}
-	rf.cond.L.Unlock()
 
 	majorityThrsh := len(rf.peers) / 2
 
@@ -195,7 +195,7 @@ func (rf *Raft) commitEntries(term int) {
 		rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("Updated rf.commitIndex=%d\n\trf.matchIndex=%v\n\tmajorityCount=%d", rf.commitIndex, rf.matchIndex, majorityCount))
 	}
 
-	if term == rf.currTerm && rf.lastApplied < rf.commitIndex {
+	if term == rf.currTerm && rf.lastApplied < rf.commitIndex && rf.commitIndex < len(rf.logs) {
 		rf.logger.Log(LogTopicCommittingEntriesApe, fmt.Sprintf("Leader is applying logs [from=%d, to=%d] ..., leaderId=%d, rf.commitIndex=%d\n\tlen(logs)=%d\n\tlogs=%v", rf.lastApplied+1, rf.commitIndex, rf.leaderId, rf.commitIndex, len(rf.logs), rf.logs))
 
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
