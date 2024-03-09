@@ -67,6 +67,7 @@ sinaee@pender:~$ tar xzvf i_87654321.tar.gz
 
 - See [Lab 1 instructions](docs/lab1.md)
 - See [Lab 2 instructions (lab2A, lab2B, lab2C, lab2D)](docs/lab2.md)
+- See [Lab 3 instructions (lab3A, lab3B)](docs/lab3.md)
 
 # Acknowledgements
 The programming labs are based on the labs developed by Robert Morris, Frans Kaashoek, and Nickolai Zeldovich at MIT as part of their graduate course on Distributed Systems (6.584), and are reused with permission from the content authors.
