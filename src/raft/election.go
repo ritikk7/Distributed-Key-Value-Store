@@ -7,67 +7,30 @@ import (
 
 // startSendingHB sends HB to each server every TIMEOUT milliseconds
 func (rf *Raft) startSendingHB() {
+	var raftState RaftState
+	var nextIndex int
+
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.raftState != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		currTerm := rf.currTerm
-		leaderCommitIdx := rf.commitIndex
-		nextIdx := len(rf.logs)
-		prevLogIdx := nextIdx - 1
-		prevLogTerm := rf.logs[prevLogIdx].Term
+		raftState = rf.raftState
+		nextIndex = rf.XIndex + len(rf.logs) + 1 // lastLogIndex + 1
 		rf.mu.Unlock()
 
+		if raftState != Leader || rf.killed() {
+			rf.logger.Log(-1, "(startSendingHB) NOT A LEADER OR KILLED ... ")
+			return
+		}
+
 		for pId := range rf.peers {
-			go rf.sendHB(pId, prevLogIdx, prevLogTerm, leaderCommitIdx, currTerm)
+			if pId != rf.me {
+				go rf.sendEntry(pId, nextIndex)
+			}
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	rf.logger.Log(LogTopicElection, fmt.Sprintf("stopped sending AppendEntries, currTerm=%d", rf.currTerm))
-}
-
-// sendHB calls the AppendEntries RPC of sever pId with empty entries
-func (rf *Raft) sendHB(pId, prevLogIdx, prevLogTerm, leaderCommitIdx, currTerm int) {
-	if pId == rf.me {
-		return
-	}
-
-	args := AppendEntriesArg{
-		Term:         currTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIdx,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      []LogEntry{},
-		LeaderCommit: leaderCommitIdx,
-	}
-	reply := AppendEntriesReply{}
-
-	ok := rf.peers[pId].Call(APPEND_ENTRIES_RPC, &args, &reply)
-
-	if ok {
-		rf.mu.Lock()
-		if rf.raftState != Leader || currTerm != reply.Term {
-			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("(RETURN) HB rejected from S%d; either I'm not a leader or got an old reply. state=%d, sentTerm=%d, replyTerm=%d, rf.currTerm=%d", pId, rf.raftState, currTerm, reply.Term, rf.currTerm))
-			rf.mu.Unlock()
-			return
-		}
-		if rf.currTerm < reply.Term {
-			rf.logger.Log(LogTopicHeartbeat, fmt.Sprintf("(RETURN) HB sent in term=%d to S%d has a higher term %d than mine=%d; turn to a follower ...", currTerm, pId, reply.Term, rf.currTerm))
-			rf.raftState = Follower
-			rf.currTerm = reply.Term
-			rf.persist()
-
-			rf.mu.Unlock()
-			return
-		}
-		rf.mu.Unlock()
-
-		rf.cond.Broadcast()
-	}
+	rf.logger.Log(LogTopicElection, fmt.Sprintf("(startSendingHB) KILLED, currTerm=%d", rf.currTerm))
 }
 
 // startEelction starts an election
@@ -88,7 +51,6 @@ func (rf *Raft) startElection() {
 
 	// 1. increment my term
 	rf.currTerm += 1
-	rf.persist()
 
 	// 2. vote for myself
 	rf.votedFor = rf.me
@@ -96,11 +58,16 @@ func (rf *Raft) startElection() {
 
 	// 3. ask others to vote for me as well
 	args := &RequestVoteArgs{
-		Term:        rf.currTerm,
-		CandId:      rf.me,
-		LastLogIdx:  len(rf.logs) - 1,
-		LastLogTerm: rf.logs[len(rf.logs)-1].Term,
+		Term:   rf.currTerm,
+		CandId: rf.me,
 	}
+	args.LastLogIdx = rf.XIndex
+	args.LastLogTerm = rf.XTerm
+	if lastIdx := len(rf.logs) - 1; lastIdx >= 0 {
+		args.LastLogIdx += len(rf.logs)
+		args.LastLogTerm = rf.logs[lastIdx].Term
+	}
+
 	args.Term = rf.currTerm
 	args.CandId = rf.me
 
@@ -135,8 +102,14 @@ func (rf *Raft) startElection() {
 
 	// let's count the votes
 	for gotVotes < majority && recVotes < len(rf.peers) {
-		if <-voteCh {
-			gotVotes += 1
+		select {
+		case <-rf.quit:
+			rf.logger.Log(-1, "CHANN CLOSED (START_ELECTION GR)")
+			return
+		case gotIt := <-voteCh:
+			if gotIt {
+				gotVotes += 1
+			}
 		}
 		recVotes += 1
 	}
@@ -162,13 +135,17 @@ func (rf *Raft) startElection() {
 
 		// reset my nextIndex and matchIndex after election
 		// nextIndex intialiazed to the last entry's index in the leader's logs
-		rf.cond.L.Lock()
-		logLen := len(rf.logs)
-		for i := range rf.peers {
-			rf.nextIndex[i] = logLen
-			rf.matchIndex[i] = 0
+		logLen := rf.XIndex // this is going to be the nextIndx
+		if currLogLen := len(rf.logs); currLogLen > 0 {
+			logLen += currLogLen
 		}
-		rf.cond.L.Unlock()
+
+		// rf.cond.L.Lock()
+		for i := range rf.peers {
+			rf.nextIndex[i] = logLen + 1
+			rf.matchIndex[i] = 0 // default values
+		}
+		// rf.cond.L.Unlock()
 
 		// start sending HBs
 		go rf.startSendingHB()
