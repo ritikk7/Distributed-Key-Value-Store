@@ -19,8 +19,9 @@ const (
 	LogTopicStartCmd
 	LogTopicElection
 	LogTopicHeartbeat
-	LogTopicSnapshot
-	Misc
+	LogTopicSnapshots
+	LogTopicInstallSnapshotRPC
+	LogTopicSendInstallSnapshot
 )
 const TermColor string = "\x1b[0m"
 
@@ -43,7 +44,7 @@ func (l *Logger) Log(topic LogTopic, message string) {
 	leftAlgn := fmt.Sprintf("S%d [%s]", l.sid, topicStr)
 
 	if Debug {
-		fmt.Printf("%s%-22s: %s%s\n", color, leftAlgn, message, "\x1b[0m")
+		fmt.Printf("%s%-22s:%s %s\n", color, leftAlgn, "\x1b[0m", message)
 	}
 }
 
@@ -52,7 +53,7 @@ func (l *Logger) sIdToColor(sId int) string {
 	case sId == 0:
 		return "\x1b[31m" // Red color
 	case sId == 1:
-		return "\x1b[37m" // White color
+		return "\x1b[32m" // Green color
 	case sId == 2:
 		return "\x1b[33m" // Yellow color
 	case sId == 3:
@@ -62,7 +63,7 @@ func (l *Logger) sIdToColor(sId int) string {
 	case sId == 5:
 		return "\x1b[36m" // Cyan color
 	case sId == 6:
-		return "\x1b[32m" // Green color
+		return "\x1b[37m" // White color
 	case sId == 7:
 		return "\x1b[91m" // Light red color
 	case sId == 8:
@@ -94,15 +95,19 @@ func (l *Logger) topicToString(topic LogTopic) (string, string) {
 	case LogTopicLogUpdateApe:
 		return "APNDE_LOG_UPDATE", "\x1b[91m" // Light red color
 	case LogTopicAppendEntryRpc:
-		return "APNDE", "\x1b[92m" // Light green color
+		return "APNDE_RPC", "\x1b[92m" // Light green color
 	case LogTopicStartCmd:
-		return "START", "\x1b[93m" // Light yellow color
+		return "START_RPC", "\x1b[93m" // Light yellow color
 	case LogTopicElection:
 		return "ELECTION", "\x1b[94m" // Light blue color
 	case LogTopicHeartbeat:
 		return "HEART_BEAT", "\x1b[95m" // Light magenta color
-	case LogTopicSnapshot:
-		return "SNAPSHOT", "\x1b[95m"
+	case LogTopicSnapshots:
+		return "SNAPSHOT_RPC", "\x1b[94m" // Light blue color
+	case LogTopicInstallSnapshotRPC:
+		return "INSTALL_SNAPSHOT_RPC", "\x1b[94m"
+	case LogTopicSendInstallSnapshot:
+		return "SENDING_INSTALL_SNP", "\x1b[94m"
 	default:
 		return "MISC", "\x1b[97m" // Bright white color
 	}
