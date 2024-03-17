@@ -18,11 +18,18 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op    string
+	Key   string
+	Value string
+}
+
+type Entry struct {
+	key   string
+	value string
 }
 
 type KVServer struct {
@@ -35,15 +42,85 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	entries []Entry
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	// check if the current raft is killed or is the leader and submit operation through Start()
+	kv.mu.Lock()
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+	}
+	op := Op{Op: GET, Key: args.Key}
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Unlock()
+
+	msg := <-kv.applyCh
+	kv.mu.Lock()
+	if msg.CommandValid && msg.Command == op && msg.CommandIndex == index {
+		for _, entry := range kv.entries {
+			if entry.key == args.Key {
+				reply.Err = OK
+				reply.Value = entry.value
+				kv.mu.Unlock()
+				return
+			}
+		}
+		reply.Err = ErrNoKey
+		reply.Value = ""
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+	kv.mu.Unlock()
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// check if the current raft is killed or is the leader and submit operation through Start()
+	kv.mu.Lock()
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+	}
+	op := Op{Op: GET, Key: args.Key}
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Unlock()
+	msg := <-kv.applyCh
+	kv.mu.Lock()
+	if msg.CommandValid && msg.CommandIndex == index && msg.Command == op {
+		for _, entry := range kv.entries {
+			if entry.key == args.Key {
+				if args.Op == PUT {
+					// put command
+					entry.value = args.Value
+				} else {
+					// append command
+					entry.value += args.Value
+				}
+				reply.Err = OK
+				kv.mu.Unlock()
+				return
+			}
+		}
+		// otherwise no key was found
+		kv.entries = append(kv.entries, Entry{key: args.Key, value: args.Value})
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+	kv.mu.Unlock()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +169,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.entries = []Entry{}
 
 	return kv
 }
