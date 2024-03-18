@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync/atomic"
-	"time"
 )
 
 type Clerk struct {
@@ -63,7 +62,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond) // Wait a bit before retrying
+		// time.Sleep(100 * time.Millisecond) // Wait a bit before retrying
 	}
 }
 
@@ -90,13 +89,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				return
 			}
 		}
-		time.Sleep(30 * time.Millisecond) // Wait a bit before retrying
+		// time.Sleep(30 * time.Millisecond) // Wait a bit before retrying
 	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND)
 }

@@ -55,47 +55,48 @@ type KVServer struct {
 
 func (kv *KVServer) ReadApplyMessages() {
 	for !kv.killed() {
-		msg := <-kv.applyCh
+		for msg := range kv.applyCh {
 
-		if msg.CommandValid {
-			command := msg.Command.(Op)
-			command.Index = msg.CommandIndex
-			if command.Op == GET {
-				kv.mu.Lock()
-				command.Err = ErrNoKey
-				command.Value = ""
-				for _, entry := range kv.entries {
-					if entry.key == command.Key {
-						command.Err = OK
-						command.Value = entry.value
-						break
-					}
-				}
-				kv.mu.Unlock()
-				// apply nothing in particular, just let the client know it worked
-			} else if command.Op == PUT || command.Op == APPEND {
-				hasKey := false
-				kv.mu.Lock()
-				for i, entry := range kv.entries {
-					if entry.key == command.Key {
-						hasKey = true
-						if command.Op == PUT {
-							// put command
-							kv.entries[i].value = "command.Value"
-						} else {
-							// append command
-							kv.entries[i].value = entry.value + " command.Value"
+			if msg.CommandValid {
+				command := msg.Command.(Op)
+				command.Index = msg.CommandIndex
+				if command.Op == GET {
+					kv.mu.Lock()
+					command.Err = ErrNoKey
+					command.Value = ""
+					for _, entry := range kv.entries {
+						if entry.key == command.Key {
+							command.Err = OK
+							command.Value = entry.value
+							break
 						}
-						break
 					}
+					kv.mu.Unlock()
+					// apply nothing in particular, just let the client know it worked
+				} else if command.Op == PUT || command.Op == APPEND {
+					hasKey := false
+					kv.mu.Lock()
+					for i, entry := range kv.entries {
+						if entry.key == command.Key {
+							hasKey = true
+							if command.Op == PUT {
+								// put command
+								kv.entries[i].value = command.Value
+							} else {
+								// append command
+								kv.entries[i].value = entry.value + command.Value
+							}
+							break
+						}
+					}
+					// otherwise if no key was found
+					if !hasKey {
+						kv.entries = append(kv.entries, Entry{key: command.Key, value: command.Value})
+					}
+					kv.mu.Unlock()
 				}
-				// otherwise if no key was found
-				if !hasKey {
-					kv.entries = append(kv.entries, Entry{key: command.Key, value: "command.Value"})
-				}
-				kv.mu.Unlock()
+				kv.clientReqs[msg.CommandIndex] <- command
 			}
-			kv.clientReqs[msg.CommandIndex] <- command
 		}
 
 	}
@@ -103,17 +104,19 @@ func (kv *KVServer) ReadApplyMessages() {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-
 	go func() {
-
 		if kv.killed() {
 			reply.Err = ErrWrongLeader
+			return
 		}
 		kv.mu.Lock()
-		if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
-			reply.Err = ErrOldRequest
-			kv.mu.Unlock()
-			return
+		_, ok := kv.lastClientCalls[args.ClientId]
+		if ok {
+			if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
+				reply.Err = ErrOldRequest
+				kv.mu.Unlock()
+				return
+			}
 		}
 
 		kv.lastClientCalls[args.ClientId] = ClientInfo{args.RequestId}
@@ -147,23 +150,27 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	// check if the current raft is killed or is the leader and submit operation through Start()
-	go func() {
 
+	go func() {
 		if kv.killed() {
 			reply.Err = ErrWrongLeader
+			return
 		}
 
 		kv.mu.Lock()
-		if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
-			reply.Err = ErrOldRequest
-			kv.mu.Unlock()
-			return
+		_, ok := kv.lastClientCalls[args.ClientId]
+		if ok {
+			if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
+				reply.Err = ErrOldRequest
+				kv.mu.Unlock()
+				return
+			}
 		}
 
 		kv.lastClientCalls[args.ClientId] = ClientInfo{args.RequestId}
 		kv.mu.Unlock()
 
-		op := Op{Op: GET, Key: args.Key, Value: args.Value}
+		op := Op{Op: args.Op, Key: args.Key, Value: args.Value}
 		index, _, isLeader := kv.rf.Start(op)
 
 		if !isLeader {
@@ -231,9 +238,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.entries = make([]Entry, 5)
+	kv.entries = make([]Entry, 0)
 	kv.clientReqs = make(map[int]chan Op)
 	kv.lastClientCalls = make(map[int64]ClientInfo)
+	// kv.entries[0] = Entry{key: "0", value: "x 0 0 y"}
 
 	go kv.ReadApplyMessages()
 
