@@ -90,7 +90,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond) // Wait a bit before retrying
+		time.Sleep(30 * time.Millisecond) // Wait a bit before retrying
 	}
 }
 

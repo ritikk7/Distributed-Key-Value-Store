@@ -25,11 +25,17 @@ type Op struct {
 	Op    string
 	Key   string
 	Value string
+	Term  int
+	Err   Err
+	Index int
 }
 
 type Entry struct {
 	key   string
 	value string
+}
+type ClientInfo struct {
+	lastReqID int64
 }
 
 type KVServer struct {
@@ -42,85 +48,141 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	entries []Entry
+	entries         []Entry
+	clientReqs      map[int]chan Op
+	lastClientCalls map[int64]ClientInfo
+}
+
+func (kv *KVServer) ReadApplyMessages() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+
+		if msg.CommandValid {
+			command := msg.Command.(Op)
+			command.Index = msg.CommandIndex
+			if command.Op == GET {
+				kv.mu.Lock()
+				command.Err = ErrNoKey
+				command.Value = ""
+				for _, entry := range kv.entries {
+					if entry.key == command.Key {
+						command.Err = OK
+						command.Value = entry.value
+						break
+					}
+				}
+				kv.mu.Unlock()
+				// apply nothing in particular, just let the client know it worked
+			} else if command.Op == PUT || command.Op == APPEND {
+				hasKey := false
+				kv.mu.Lock()
+				for i, entry := range kv.entries {
+					if entry.key == command.Key {
+						hasKey = true
+						if command.Op == PUT {
+							// put command
+							kv.entries[i].value = "command.Value"
+						} else {
+							// append command
+							kv.entries[i].value = entry.value + " command.Value"
+						}
+						break
+					}
+				}
+				// otherwise if no key was found
+				if !hasKey {
+					kv.entries = append(kv.entries, Entry{key: command.Key, value: "command.Value"})
+				}
+				kv.mu.Unlock()
+			}
+			kv.clientReqs[msg.CommandIndex] <- command
+		}
+
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	// check if the current raft is killed or is the leader and submit operation through Start()
-	kv.mu.Lock()
-	if kv.killed() {
-		reply.Err = ErrWrongLeader
-	}
-	op := Op{Op: GET, Key: args.Key}
-	index, _, isLeader := kv.rf.Start(op)
+	go func() {
 
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	kv.mu.Unlock()
-
-	msg := <-kv.applyCh
-	kv.mu.Lock()
-	if msg.CommandValid && msg.Command == op && msg.CommandIndex == index {
-		for _, entry := range kv.entries {
-			if entry.key == args.Key {
-				reply.Err = OK
-				reply.Value = entry.value
-				kv.mu.Unlock()
-				return
-			}
+		if kv.killed() {
+			reply.Err = ErrWrongLeader
 		}
-		reply.Err = ErrNoKey
-		reply.Value = ""
-	} else {
-		reply.Err = ErrWrongLeader
-	}
-	kv.mu.Unlock()
+		kv.mu.Lock()
+		if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
+			reply.Err = ErrOldRequest
+			kv.mu.Unlock()
+			return
+		}
 
+		kv.lastClientCalls[args.ClientId] = ClientInfo{args.RequestId}
+		kv.mu.Unlock()
+
+		op := Op{Op: GET, Key: args.Key}
+		index, _, isLeader := kv.rf.Start(op)
+
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		result := <-kv.clientReqs[index]
+
+		if result.Op != GET || result.Key != args.Key {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		if result.Err == ErrNoKey {
+			reply.Err = ErrNoKey
+			reply.Value = ""
+			return
+		}
+		reply.Err = OK
+		reply.Value = result.Value
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	// check if the current raft is killed or is the leader and submit operation through Start()
-	kv.mu.Lock()
-	if kv.killed() {
-		reply.Err = ErrWrongLeader
-	}
-	op := Op{Op: GET, Key: args.Key}
-	index, _, isLeader := kv.rf.Start(op)
+	go func() {
 
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	kv.mu.Unlock()
-	msg := <-kv.applyCh
-	kv.mu.Lock()
-	if msg.CommandValid && msg.CommandIndex == index && msg.Command == op {
-		for _, entry := range kv.entries {
-			if entry.key == args.Key {
-				if args.Op == PUT {
-					// put command
-					entry.value = args.Value
-				} else {
-					// append command
-					entry.value += args.Value
-				}
-				reply.Err = OK
-				kv.mu.Unlock()
-				return
-			}
+		if kv.killed() {
+			reply.Err = ErrWrongLeader
 		}
-		// otherwise no key was found
-		kv.entries = append(kv.entries, Entry{key: args.Key, value: args.Value})
+
+		kv.mu.Lock()
+		if kv.lastClientCalls[args.ClientId].lastReqID >= args.RequestId {
+			reply.Err = ErrOldRequest
+			kv.mu.Unlock()
+			return
+		}
+
+		kv.lastClientCalls[args.ClientId] = ClientInfo{args.RequestId}
+		kv.mu.Unlock()
+
+		op := Op{Op: GET, Key: args.Key, Value: args.Value}
+		index, _, isLeader := kv.rf.Start(op)
+
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		result := <-kv.clientReqs[index]
+		if !(result.Op == APPEND || result.Op == PUT) {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		if result.Key != args.Key {
+			reply.Err = ErrWrongLeader
+			return
+		}
 		reply.Err = OK
-	} else {
-		reply.Err = ErrWrongLeader
-	}
-	kv.mu.Unlock()
+	}()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -169,7 +231,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.entries = []Entry{}
+	kv.entries = make([]Entry, 5)
+	kv.clientReqs = make(map[int]chan Op)
+	kv.lastClientCalls = make(map[int64]ClientInfo)
+
+	go kv.ReadApplyMessages()
 
 	return kv
 }
