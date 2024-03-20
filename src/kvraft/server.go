@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      string
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int64
 }
 
 type KVServer struct {
@@ -35,15 +40,146 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	entries         map[string]string
+	lastClientCalls map[int64]int64
+	clientReqs      map[int]chan Op
 }
 
+func (kv *KVServer) ReadApplyMessages() {
+	for !kv.killed() {
+		for msg := range kv.applyCh {
+			kv.mu.Lock()
+
+			if !msg.CommandValid {
+				kv.mu.Unlock()
+				continue
+			}
+
+			command := msg.Command.(Op)
+			var opResult Op = command
+
+			lastAppliedId, exists := kv.lastClientCalls[command.ClientId]
+			if !exists || command.RequestId > lastAppliedId {
+				kv.lastClientCalls[command.ClientId] = command.RequestId
+
+				switch command.Type {
+				case GET:
+					value, ok := kv.entries[command.Key]
+					if ok {
+						opResult.Value = value
+					}
+				case PUT:
+					kv.entries[command.Key] = command.Value
+				case APPEND:
+					kv.entries[command.Key] += command.Value
+				}
+
+				if ch, ok := kv.clientReqs[msg.CommandIndex]; ok {
+					select {
+					case ch <- opResult:
+					default:
+					}
+				} else {
+					kv.clientReqs[msg.CommandIndex] = make(chan Op, 1)
+					kv.clientReqs[msg.CommandIndex] <- opResult
+				}
+			}
+
+			kv.mu.Unlock()
+		}
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	lastAppliedId, ok := kv.lastClientCalls[args.ClientId]
+	if ok && args.RequestId <= lastAppliedId {
+		reply.Err = OK
+		reply.Value = kv.entries[args.Key]
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{Type: GET, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId}
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	ch, ok := kv.clientReqs[index]
+	if !ok {
+		ch = make(chan Op, 1)
+		kv.clientReqs[index] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case appliedOp := <-ch:
+		if appliedOp.ClientId == args.ClientId && appliedOp.RequestId == args.RequestId {
+			reply.Err = OK
+			reply.Value = appliedOp.Value
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(800 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	lastAppliedId, ok := kv.lastClientCalls[args.ClientId]
+	if ok && args.RequestId <= lastAppliedId {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	opType := PUT
+	if args.Op == APPEND {
+		opType = APPEND
+	}
+	op := Op{Type: opType, Key: args.Key, Value: args.Value, ClientId: args.ClientId, RequestId: args.RequestId}
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	ch, ok := kv.clientReqs[index]
+	if !ok {
+		ch = make(chan Op, 1)
+		kv.clientReqs[index] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case appliedOp := <-ch:
+		if appliedOp.ClientId == args.ClientId && appliedOp.RequestId == args.RequestId {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(800 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +228,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.entries = make(map[string]string)
+	kv.lastClientCalls = make(map[int64]int64)
+	kv.clientReqs = make(map[int]chan Op)
+
+	go kv.ReadApplyMessages()
 
 	return kv
 }
