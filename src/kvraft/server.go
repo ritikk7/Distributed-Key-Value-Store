@@ -7,9 +7,9 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+	"fmt"
 )
-
-const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -20,9 +20,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key 		string
+	Value		string
+	Operation 	string // Get Put Append
+	ClerkId		int64
+	Seq 		int64
 }
 
 type KVServer struct {
@@ -34,16 +36,106 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	logger *Logger
+	db             map[string]string
+	clerkLastSeq   map[int64]int64 // To check for duplicate requests
+	notifyChans    map[int64]chan Op
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Operation: "Get",
+		ClerkId:   args.ClerkId,
+		Seq:       args.Seq,
+	}
+
+	kv.mu.Lock()
+	// first check if this server is the leader
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d is not the leader for Get request on key %s", kv.me, args.Key))
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	ch := make(chan Op, 1)
+	kv.notifyChans[args.ClerkId] = ch
+	kv.rf.Start(op)
+	kv.mu.Unlock()
+
+    kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d started a Get request for key %s from C%d", kv.me, args.Key, args.ClerkId))
+
+	// set up a timer to avoid waiting indefinitely.
+	timer := time.NewTimer(WaitTimeOut)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C: // timer expires
+		kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out waiting for Get request on key %s", kv.me, args.Key))
+		reply.Err = ErrTimeOut
+		return
+	case resultOp := <-ch: // wait for the operation to be applied
+		// check if the operation corresponds to the request
+		if resultOp.ClerkId != args.ClerkId || resultOp.Seq != args.Seq {
+			kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d received a non-matching Get result for key %s", kv.me, args.Key))
+			reply.Err = ErrWrongLeader
+		} else {
+			kv.mu.Lock()
+			reply.Value = kv.db[args.Key]
+			reply.Err = OK
+			kv.mu.Unlock()
+			kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed Get request for key %s", kv.me, args.Key))
+
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Operation: args.Op, // Put Append
+		ClerkId:   args.ClerkId,
+		Seq:       args.Seq,
+	}
+
+	kv.mu.Lock()
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected PutAppend request on key %s as it's not the leader", kv.me, args.Key))
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	ch := make(chan Op, 1)
+	kv.notifyChans[args.ClerkId] = ch
+	kv.rf.Start(op)
+	kv.mu.Unlock()
+
+	kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d started PutAppend (%s) request for key %s from C%d", kv.me, args.Op, args.Key, args.ClerkId))
+
+
+	timer := time.NewTimer(WaitTimeOut)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C: // on time out
+		kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on PutAppend request for key %s", kv.me, args.Key))
+		reply.Err = ErrTimeOut
+		return
+	case resultOp := <-ch:
+		// Check if the operation result corresponds to the original request.
+		if resultOp.ClerkId != args.ClerkId || resultOp.Seq != args.Seq {
+			kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for PutAppend request on key %s", kv.me, args.Key))
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+			kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed PutAppend request for key %s", kv.me, args.Key))
+
+		}
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -57,7 +149,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -78,6 +169,11 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+	logger, err := NewLogger(1)
+	if err != nil {
+		fmt.Println("Couldn't open the log file", err)
+	}
+
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -85,13 +181,61 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.logger = logger
 
-	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.clerkLastSeq = make(map[int64]int64)
+	kv.notifyChans = make(map[int64]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.applier()
 
 	return kv
+}
+
+
+
+func (kv *KVServer) applier() {
+	// continuously process messages from the applyCh channel
+	for !kv.killed() {
+		msg := <-kv.applyCh // wait for a message from Raft
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			kv.mu.Lock()
+
+			// check if the operation is the latest from the clerk
+			lastSeq, found := kv.clerkLastSeq[op.ClerkId]
+			if !found || lastSeq < op.Seq {
+				// apply the operation to the state machine
+				kv.applyOperation(op)
+				kv.clerkLastSeq[op.ClerkId] = op.Seq
+			}
+
+			// notify the waiting goroutine if it's present
+			if ch, ok := kv.notifyChans[op.ClerkId]; ok {
+				select {
+				case ch <- op: // notify the waiting goroutine
+				    kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d notified the goroutine for ClerkId %d", kv.me, op.ClerkId))
+				default:
+					// if the channel is already full, skip to prevent blocking.
+
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+
+func (kv *KVServer) applyOperation(op Op) {
+	switch op.Operation {
+	case "Put":
+		kv.db[op.Key] = op.Value
+	case "Append":
+		kv.db[op.Key] += op.Value
+	case "Get":
+		// No state change for Get
+	}
 }
