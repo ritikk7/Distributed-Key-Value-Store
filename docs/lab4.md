@@ -25,8 +25,6 @@ NOTE: This lab uses "configuration" to refer to the assignment of shards to repl
 
 This lab's general architecture (a configuration service and a set of replica groups) follows the same general pattern as Flat Datacenter Storage, BigTable, Spanner, FAWN, Apache HBase, Rosebud, Spinnaker, and many others. These systems differ in many details from this lab, though, and are also typically more sophisticated and capable. For example, the lab doesn't evolve the sets of peers in each Raft group; its data and query models are very simple; and handoff of shards is slow and doesn't allow concurrent client access.
 
-NOTE: Your Lab 4 sharded server, Lab 4 shard controller, and Lab 3 kvraft must all use the same Raft implementation.
-
 
 ### Getting Started
 
