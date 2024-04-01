@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 	"fmt"
+	"bytes"
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -40,6 +41,10 @@ type KVServer struct {
 	db             map[string]string
 	clerkLastSeq   map[int64]int64 // To check for duplicate requests
 	notifyChans    map[int64]chan Op
+
+	snapshotCh     chan bool
+	lastApplied    int 
+	persister      *raft.Persister
 }
 
 
@@ -188,9 +193,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notifyChans = make(map[int64]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+
+	kv.snapshotCh = make(chan bool)
+	kv.persister = persister
+	kv.readSnapshot(kv.persister.ReadSnapshot())
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applier()
+	go kv.snapshotChecker()
 
 	return kv
 }
@@ -202,8 +212,13 @@ func (kv *KVServer) applier() {
 	for !kv.killed() {
 		msg := <-kv.applyCh // wait for a message from Raft
 		if msg.CommandValid {
-			op := msg.Command.(Op)
 			kv.mu.Lock()
+			if msg.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+
+			op := msg.Command.(Op)
 
 			// check if the operation is the latest from the clerk
 			lastSeq, found := kv.clerkLastSeq[op.ClerkId]
@@ -223,7 +238,17 @@ func (kv *KVServer) applier() {
 
 				}
 			}
+
+			kv.lastApplied = msg.CommandIndex
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d triggered a snapshot creation due to raft state size", kv.me))
+				go func() { kv.snapshotCh <- true }()
+			}
 			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.readSnapshot(msg.Snapshot)
+			kv.lastApplied = msg.SnapshotIndex
+			kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d processed a snapshot message", kv.me))
 		}
 	}
 }
@@ -237,5 +262,63 @@ func (kv *KVServer) applyOperation(op Op) {
 		kv.db[op.Key] += op.Value
 	case "Get":
 		// No state change for Get
+	}
+}
+
+
+func (kv *KVServer) takeSnapshot() {
+	kv.mu.Lock()
+
+	// check if snapshot is necessary based on the maxraftstate size
+	if kv.persister.RaftStateSize() <= kv.maxraftstate || kv.maxraftstate == -1 {
+		kv.mu.Unlock()
+		return
+	}
+
+	kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d starts taking a snapshot", kv.me))
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.lastApplied)
+	e.Encode(kv.db)
+	e.Encode(kv.clerkLastSeq)
+	data := w.Bytes()
+	index := kv.lastApplied
+	kv.mu.Unlock()
+	kv.rf.Snapshot(index, data)
+
+	kv.logger.Log(LogTopicServer, fmt.Sprintf("S%d completed taking a snapshot", kv.me))
+
+}
+
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // empty snapshot
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var lastApplied int
+	var db map[string]string
+	var clerkLastSeq map[int64]int64
+
+	if d.Decode(&lastApplied) != nil ||
+		d.Decode(&db) != nil ||
+		d.Decode(&clerkLastSeq) != nil {
+		log.Fatal("readSnapshot: error decoding data")
+	} else {
+		kv.mu.Lock()
+		kv.lastApplied = lastApplied
+		kv.db = db
+		kv.clerkLastSeq = clerkLastSeq
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) snapshotChecker() {
+	for !kv.killed() {
+		<-kv.snapshotCh
+		kv.takeSnapshot()
 	}
 }
