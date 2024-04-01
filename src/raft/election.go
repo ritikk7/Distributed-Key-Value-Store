@@ -1,36 +1,89 @@
 package raft
 
 import (
-	"fmt"
 	"time"
 )
 
 // startSendingHB sends HB to each server every TIMEOUT milliseconds
 func (rf *Raft) startSendingHB() {
-	var raftState RaftState
-	var nextIndex int
-
 	for !rf.killed() {
 		rf.mu.Lock()
-		raftState = rf.raftState
-		nextIndex = rf.XIndex + len(rf.logs) + 1 // lastLogIndex + 1
-		rf.mu.Unlock()
-
-		if raftState != Leader || rf.killed() {
-			rf.logger.Log(-1, "(startSendingHB) NOT A LEADER OR KILLED ... ")
+		if rf.raftState != Leader {
+			rf.mu.Unlock()
 			return
 		}
+		currTerm := rf.currTerm
+		leaderCommitIdx := rf.commitIndex
 
 		for pId := range rf.peers {
-			if pId != rf.me {
-				go rf.sendEntry(pId, nextIndex)
+			nextIdx := rf.nextIndex[pId]
+
+			var prevLogIndex int
+			var prevLogTerm int
+
+			// normal case
+			if rf.GetRelativeIndex(nextIdx) > 0 {
+				prevLogIndex = nextIdx - 1                                   // index of the prev log entry on my log
+				prevLogTerm = rf.log[rf.GetRelativeIndex(prevLogIndex)].Term // the term of the prev log entry
+			} else if rf.GetRelativeIndex(nextIdx) == 0 { // case where prevLogIndex == last included
+				prevLogIndex = rf.lastIncludedIndex
+				prevLogTerm = rf.lastIncludedTerm
+			} else { // case where prevLogIndex < last included
+				rf.snapshotCond[pId].Broadcast()
+				continue
 			}
+
+			Debugf(dTerm, "S%v -> S%v, sending HB, nextIdx %v, snapshotIndex %v, leaderCommit %v\n", rf.me, pId, rf.nextIndex[pId], rf.lastIncludedIndex, leaderCommitIdx)
+
+			go rf.sendHB(pId, prevLogIndex, prevLogTerm, leaderCommitIdx, currTerm)
 		}
+		rf.mu.Unlock()
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	rf.logger.Log(LogTopicElection, fmt.Sprintf("(startSendingHB) KILLED, currTerm=%d", rf.currTerm))
+	Debugf(dTerm, "S%v stopped sending HB, currTerm %v\n", rf.me, rf.currTerm)
+}
+
+// sendHB calls the AppendEntries RPC of sever pId with empty entries
+func (rf *Raft) sendHB(pId, prevLogIndex, prevLogTerm, leaderCommitIdx, currTerm int) {
+	if pId == rf.me {
+		return
+	}
+
+	args := AppendEntriesArg{
+		Term:         currTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      []LogEntry{},
+		LeaderCommit: leaderCommitIdx,
+	}
+	reply := AppendEntriesReply{}
+
+	ok := rf.peers[pId].Call(APPEND_ENTRIES_RPC, &args, &reply)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if ok {
+		if rf.raftState != Leader {
+			return
+		} else if rf.currTerm < reply.Term {
+			Debugf(dTerm, "S%v -> S%v, sendHB reply, replyTerm %v > currTerm %v, converting to follower\n", rf.me, pId, reply.Term, rf.currTerm)
+			rf.raftState = Follower
+			rf.currTerm = reply.Term
+			rf.persistState()
+			return
+		}
+
+		if reply.Term > currTerm {
+			Debugf(dTerm, "S%v -> S%v, sendHB reply, replyTerm %v > argsTerm %v\n", rf.me, pId, reply.Term, currTerm)
+			return
+		}
+	} else {
+		Debugf(dError, "S%v -> S%v, sendHB failed, no connection, term %v\n", rf.me, pId, rf.currTerm)
+	}
 }
 
 // startEelction starts an election
@@ -54,24 +107,30 @@ func (rf *Raft) startElection() {
 
 	// 2. vote for myself
 	rf.votedFor = rf.me
-	rf.persist()
+
+	rf.persistState()
 
 	// 3. ask others to vote for me as well
-	args := &RequestVoteArgs{
-		Term:   rf.currTerm,
-		CandId: rf.me,
-	}
-	args.LastLogIdx = rf.XIndex
-	args.LastLogTerm = rf.XTerm
-	if lastIdx := len(rf.logs) - 1; lastIdx >= 0 {
-		args.LastLogIdx += len(rf.logs)
-		args.LastLogTerm = rf.logs[lastIdx].Term
+	var lastLogIndex int
+	var lastLogTerm int
+	if len(rf.log) > 0 {
+		lastLogIndex = rf.GetAbsoluteIndex(len(rf.log) - 1)
+		lastLogTerm = rf.log[len(rf.log)-1].Term
+	} else {
+		lastLogIndex = rf.lastIncludedIndex
+		lastLogTerm = rf.lastIncludedTerm
 	}
 
+	args := &RequestVoteArgs{
+		Term:        rf.currTerm,
+		CandId:      rf.me,
+		LastLogIdx:  lastLogIndex,
+		LastLogTerm: lastLogTerm,
+	}
 	args.Term = rf.currTerm
 	args.CandId = rf.me
 
-	rf.logger.Log(LogTopicElection, fmt.Sprintf("starting an election; currTerm=%d", rf.currTerm))
+	Debugf(dLeader, "S%v starting ELECTION, term %v\n", rf.me, rf.currTerm)
 
 	rf.mu.Unlock()
 
@@ -93,6 +152,9 @@ func (rf *Raft) startElection() {
 			go func(i int) {
 				reply := &RequestVoteReply{}
 				ok := rf.peers[i].Call(REQUEST_VOTE_RPC, args, reply)
+				if !ok {
+					Debugf(dError, "S%v -> S%v, RequestVote failed, no connection, term %v\n", rf.me, i, rf.currTerm)
+				}
 
 				// make sure we don't get old responses
 				voteCh <- ok && reply.VoteGranted && reply.Term == args.Term
@@ -102,14 +164,8 @@ func (rf *Raft) startElection() {
 
 	// let's count the votes
 	for gotVotes < majority && recVotes < len(rf.peers) {
-		select {
-		case <-rf.quit:
-			rf.logger.Log(-1, "CHANN CLOSED (START_ELECTION GR)")
-			return
-		case gotIt := <-voteCh:
-			if gotIt {
-				gotVotes += 1
-			}
+		if <-voteCh {
+			gotVotes += 1
 		}
 		recVotes += 1
 	}
@@ -128,24 +184,20 @@ func (rf *Raft) startElection() {
 
 		// change the state to Leader
 		rf.mu.Lock()
-		rf.logger.Log(LogTopicElection, fmt.Sprintf("Got the majority. I'm the leader now; currTerm=%d, my_log=%+v", rf.currTerm, rf.logs))
+		Debugf(dLeader, "S%v ELECTION won, term %v\n", rf.me, rf.currTerm)
 
 		rf.raftState = Leader
 		rf.leaderId = rf.me
 
 		// reset my nextIndex and matchIndex after election
 		// nextIndex intialiazed to the last entry's index in the leader's logs
-		logLen := rf.XIndex // this is going to be the nextIndx
-		if currLogLen := len(rf.logs); currLogLen > 0 {
-			logLen += currLogLen
-		}
-
-		// rf.cond.L.Lock()
+		rf.cond.L.Lock()
+		lastLogIndexRel := len(rf.log)
 		for i := range rf.peers {
-			rf.nextIndex[i] = logLen + 1
-			rf.matchIndex[i] = 0 // default values
+			rf.nextIndex[i] = rf.GetAbsoluteIndex(lastLogIndexRel)
+			rf.matchIndex[i] = 0
 		}
-		// rf.cond.L.Unlock()
+		rf.cond.L.Unlock()
 
 		// start sending HBs
 		go rf.startSendingHB()
@@ -153,6 +205,7 @@ func (rf *Raft) startElection() {
 		// start syncing the entries in the log
 		for pId := range rf.peers {
 			go rf.syncLogEntries(pId, rf.currTerm)
+			go rf.sendSnapshots(pId, rf.currTerm)
 		}
 
 		rf.mu.Unlock()

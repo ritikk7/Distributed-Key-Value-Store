@@ -1,237 +1,226 @@
 package raft
 
-import (
-	"fmt"
-	"time"
-)
-
 // syncLogEntries is run by the leader and sends AppendEntries to all followers
 func (rf *Raft) syncLogEntries(pId int, term int) {
 	// skip myself
 	if pId == rf.me {
 		return
 	}
-	rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(syncLogEntries) START SYNCING WITH S%d, term=%d ...", pId, term))
 
-	var raftState RaftState
-	var CurrTerm, XIndex, NextIndex, LogLen int
-
+	// while I'm the leader, ask this peer to append the entry
+	//  1- if pId is down; try again
+	//  2- if pId's log is not up-to-date; try another index
+	//  3- if pId's log is up-to-date; commit the log entry for current term if we got the majority of followers replicated the log entry
 	for !rf.killed() {
 		rf.mu.Lock()
-		raftState = rf.raftState
-		CurrTerm = rf.currTerm
-
-		XIndex = rf.XIndex
-
-		LogLen = XIndex + len(rf.logs)
-		NextIndex = rf.nextIndex[pId]
-
-		rf.mu.Unlock()
-
-		if raftState != Leader || CurrTerm > term {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(syncLogEntries) NOT A LEADER or OLD TERM RETURN ..., state=%v, termSent=%d, currTerm=%d", raftState, term, CurrTerm))
+		if rf.raftState != Leader || rf.currTerm > term {
+			Debugf(dTerm, "S%v stopped syncLogEntries, state %v != leader OR currTerm %v > initialTerm %v\n", rf.me, rf.raftState, rf.currTerm, term)
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 
+		// if there is nothing to send; just wait for the new entries to be added to the log
 		rf.cond.L.Lock()
-		if NextIndex > LogLen {
-			// there is no new logs to be added; just wait for someone to wake me up
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(syncLogEntries) WAITING FOR BROADCAST... rf.nextIndex[S%d]=%d, logLen=%d", pId, NextIndex, LogLen))
+		for rf.matchIndex[pId] >= rf.GetAbsoluteIndex(len(rf.log)-1) {
+			// Debugf(dInfo, "S%v -> S%v spinning, matchIndex [%v] >= lastLogIndex [%v]\n", rf.me, pId, rf.matchIndex[pId], rf.GetAbsoluteIndex(len(rf.log)-1))
 			rf.cond.Wait()
-
-			// someone asked to check if we need to sync entries
-			rf.cond.L.Unlock()
 			continue
 		}
 		rf.cond.L.Unlock()
 
-		rf.sendEntry(pId, NextIndex)
-
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func (rf *Raft) sendEntry(pId, nextIndex int) {
-	rf.mu.Lock()
-	if rf.raftState != Leader || rf.killed() {
-		rf.logger.Log(-1, "(sendEntry) NOT A LEADER OR KILLED RETURN ....")
-		rf.mu.Unlock()
-		return
-	}
-
-	CurrTerm := rf.currTerm
-	LogLen := rf.XIndex + len(rf.logs)
-
-	LeaderId := rf.me
-	LeaderCommit := rf.commitIndex
-
-	XIndex := rf.XIndex
-	XTerm := rf.XTerm
-
-	Entries := []LogEntry{}
-
-	var PrevLogIndex, PrevLogTerm int
-
-	if nIdxLog := nextIndex - XIndex - 1; nIdxLog == 0 {
-		PrevLogIndex = XIndex
-		PrevLogTerm = XTerm
-
-		Entries = make([]LogEntry, len(rf.logs))
-		copy(Entries, rf.logs)
-
-		rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) SEND ENTRIES TO S%d; WHOLE TAIL leaderCommit=%d (prevLogIndex=%d, prevLogTerm=%d) entries=%v", pId, LeaderCommit, PrevLogIndex, PrevLogTerm, Entries))
-
-	} else if nIdxLog > 0 {
-		PrevLogIndex = rf.logs[nIdxLog-1].Index
-		PrevLogTerm = rf.logs[nIdxLog-1].Term
-
-		Entries = append(Entries, rf.logs[nIdxLog:]...)
-
-		rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) SEND ENTRIES TO S%d; PARTIAL TAIL leaderCommit=%d (prevLogIndex=%d, prevLogTerm=%d) entries=%v", pId, LeaderCommit, PrevLogIndex, PrevLogTerm, Entries))
-
-	} else {
-		// nIdxLog < 0, i.e. nextIndex - XIndex < 1; either
-		//   1) nextIndex == XIndex != 0; which is fine!
-		//   2) nextIndex == XIndex == 0; which is really bad!
-		if rf.XIndex == 0 {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) ASSERTION ERROR: X_INDEX AND NEXT_INDEX BOTH ARE ZERO! Leader = S%d, rf.nextIndex=%v, rf.matchIndex=%v, status=%v", rf.leaderId, rf.nextIndex, rf.matchIndex, rf.raftState))
-		} else {
-			rf.logger.Log(-1, fmt.Sprintf("(sendEntry) NEGATIVE NEXT INDEX - SEND SNAPSHOT TO S%d  nextIdx=%d, rf.XIndex=%d, rf.XTerm=%d, len(logs)=%d logs=%v", pId, nextIndex, XIndex, XTerm, LogLen, rf.logs))
-
-			rf.sendInstallSnapshot(pId)
+		rf.mu.Lock()
+		nextIdx := rf.nextIndex[pId]
+		if nextIdx >= rf.GetAbsoluteIndex(len(rf.log)) {
+			// Debugf(dInfo, "S%v -> S%v spinning, nextIndex [%v] >= lastLogIndex [%v]\n", rf.me, pId, nextIdx, rf.GetAbsoluteIndex(len(rf.log)-1))
 			rf.mu.Unlock()
-			return
+			continue
 		}
-	}
 
-	if len(Entries) == 0 {
-		rf.logger.Log(-1, fmt.Sprintf("(sendEntry) SEND HB TO S%d, (nextIdx=%d, rf.XIndex=%d, len(logs)=%d)", pId, nextIndex, XIndex, LogLen))
-	}
+		var prevLogIndex int
+		var prevLogTerm int
+		var entries []LogEntry
+		// normal case
+		if rf.GetRelativeIndex(nextIdx) > 0 {
+			prevLogIndex = nextIdx - 1                                   // index of the prev log entry on my log
+			prevLogTerm = rf.log[rf.GetRelativeIndex(prevLogIndex)].Term // the term of the prev log entry
+			entries = rf.log[rf.GetRelativeIndex(nextIdx):]
+		} else if rf.GetRelativeIndex(nextIdx) == 0 { // case where prevLogIdx == last included
+			prevLogIndex = rf.lastIncludedIndex
+			prevLogTerm = rf.lastIncludedTerm
+			entries = rf.log
+		} else { // case where prevLogIdx < last included
+			rf.snapshotCond[pId].Broadcast()
+			rf.mu.Unlock()
+			continue
+		}
 
-	rf.mu.Unlock()
+		leaderCommit := rf.commitIndex // the index of latest commited log entry
+		leaderId := rf.me
 
-	args := AppendEntriesArg{
-		Term:         CurrTerm,
-		LeaderId:     LeaderId,
-		PrevLogIndex: PrevLogIndex,
-		PrevLogTerm:  PrevLogTerm,
-		Entries:      Entries,
-		LeaderCommit: LeaderCommit,
-	}
-	reply := AppendEntriesReply{}
+		Debugf(dLog2, "S%v -> S%v syncLogEntries, prevLogIndex %d, prevLogTerm %v, entries %v, leaderCommit %v\n", rf.me, pId, prevLogIndex, prevLogTerm, entries, leaderCommit)
+		rf.mu.Unlock()
 
-	// ok := false
-	go func() {
-		resCh := make(chan bool)
+		args := AppendEntriesArg{
+			Term:         term,
+			LeaderId:     leaderId,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: leaderCommit,
+		}
+		reply := AppendEntriesReply{}
 
-		ok := false
-		go func() {
-			resCh <- rf.peers[pId].Call(APPEND_ENTRIES_RPC, &args, &reply)
-		}()
-
-		select {
-		case <-rf.quit:
-			rf.logger.Log(-1, "CHANL CLOSED ... (SEND_ENTRY GR)")
-			return
-		case ok = <-resCh:
-			rf.logger.Log(-1, "GOT A REPLY FROM A FOLLOWER")
+		ok := rf.peers[pId].Call(APPEND_ENTRIES_RPC, &args, &reply)
+		if !ok {
+			rf.mu.Lock()
+			Debugf(dError, "S%v -> S%v, syncLogEntries failed, no connection, term %v\n", rf.me, pId, rf.currTerm)
+			rf.mu.Unlock()
+			continue
 		}
 
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
-		if !ok {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) .... S%d DID NOT RESPOND; RETURN (termSent=%d, rf.currTerm=%d) state=%v;", pId, args.Term, rf.currTerm, rf.raftState))
-			return
-		}
-		defer rf.cond.Broadcast()
-
-		if rf.killed() || rf.raftState != Leader {
-			rf.logger.Log(-1, "(sendEntry) KILLED OR NOT A LEADER .... AFTER GOT A RESPONSE")
+		if rf.raftState != Leader {
+			rf.mu.Unlock()
 			return
 		}
 
-		if rf.currTerm > args.Term {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) STALE RESPONSE FROM S%d; RETURN! (sentTerm=%d, rf.currTerm=%d)", pId, args.Term, rf.currTerm))
+		// 1- if the call was made during the previous terms; ignore the response and return
+		if rf.currTerm > term {
+			Debugf(dTerm, "S%v -> S%v, syncLogEntries reply, currTerm %v> argsTerm %v, current call outdated, stopping\n", rf.me, pId, rf.currTerm, term)
+			rf.mu.Unlock()
 			return
 		}
 
+		// 2- if my term is behind the reply; turn to a follower and update my term
 		if reply.Term > rf.currTerm {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) CHANGE TO A FOLLOWER! (leader=S%d reply.Term=%d, rf.currTerm=%d)", pId, reply.Term, rf.currTerm))
-
 			rf.raftState = Follower
-			rf.votedFor = -1
 			rf.currTerm = reply.Term
-			rf.persist()
-
-			return
-		}
-
-		if args.Term != rf.currTerm {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) ARGS.TERM != RF.CURR_TERM; RETURN ... args.Term=%d != rf.currTerm=%d! Comming from S%d", args.Term, rf.currTerm, pId))
+			rf.persistState()
+			Debugf(dTerm, "S%v -> S%v, syncLogEntries reply, replyTerm %v> currTerm %v, stopping\n", rf.me, pId, reply.Term, rf.currTerm)
+			rf.mu.Unlock()
 			return
 		}
 
 		if reply.Success {
-			rf.matchIndex[pId] = Max(rf.matchIndex[pId], args.PrevLogIndex+len(args.Entries))
-			rf.nextIndex[pId] = rf.matchIndex[pId] + 1
-
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) APPEND SUCCESSFULL BY S%d  (sentTerm=%d, rf.currTerm=%d, rf.raftState=%d) (nextIndex[S%d]=%d, matchIndex[S%d]=%d) myLastLogIndex=%d log=%v", pId, args.Term, rf.currTerm, rf.raftState, pId, rf.nextIndex[pId], pId, rf.matchIndex[pId], len(rf.logs)-1, rf.logs))
-
-			rf.commitEntries(args.Term)
-			go func() {
-				select {
-				case <-rf.quit:
-					return
-				case rf.appEntCh <- done{}:
-				}
-			}()
+			// the follower appended the entries for nextIndex
+			rf.matchIndex[pId] = nextIdx + len(entries) - 1
+			rf.nextIndex[pId] = nextIdx + len(entries)
+			Debugf(dLog2, "S%v -> S%v, syncLogEntries succeeded, nextIndex [%v], matchIndex [%v], leaderCommit %v, lastLogIndex [%v]\n", rf.me, pId, rf.nextIndex[pId], rf.matchIndex[pId], leaderCommit, prevLogIndex+len(entries))
 		} else {
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) FOLLOWER S%d REJECTED APE ...", pId))
+			// the follower rejected the entry; try another one
 
-			// Optimization for 2D:
-			// Case 0: follower asked the leader for a snapshot
-			// Optimization for 2C
-			//  by the leader
-			// 	Case 1: leader doesn't have XTerm:
-			// 		nextIndex = XIndex
-			//  Case 2: leader has XTerm:
-			// 		nextIndex = leader's last entry for XTerm
-			//  Case 3: follower's log is too short:
-			// 		nextIndex = XLen
-			if reply.NeedsSnapshot {
-				// case 0; set the nextIndex to XIndex; so the next time, we will send a snapshot
-				rf.nextIndex[pId] = rf.XIndex
-
-				rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) FOLLOWER (S%d) ASKED FOR A SNAPSHOT! SET TO X_INDEX FOR NEXT CALL nextIndex[S%d]=%d len(logs)=%d reply=%+v", pId, pId, rf.nextIndex[pId], len(rf.logs), reply))
-			} else if reply.XIsShort {
-				// case 3; we might get rejected again which we will ended up in case 1 or 2
-				rf.nextIndex[pId] = reply.XLen + 1
-
-				rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) FOLLOWER (S%d) HAS A SHORTER LOG! nextIndex[S%d]=%d len(logs)=%d reply=%+v", pId, pId, rf.nextIndex[pId], len(rf.logs), reply))
-			} else {
-
-				nextIdx := -1
-				for idx := len(rf.logs) - 1; idx > 0; idx-- {
-					if logEntry := rf.logs[idx]; logEntry.Term == reply.XTerm {
-						// case 2: leader has the term; idx is the index of the last entry
-						nextIdx = rf.logs[idx].Index
+			if reply.XTerm != -1 && reply.XIndex != -1 { // rejected because term mismatch at index
+				// find index of last XTerm on our log
+				iRel := len(rf.log) - 1
+				for iRel >= 0 {
+					if rf.log[iRel].Term == reply.XTerm {
 						break
 					}
+					iRel--
 				}
 
-				if nextIdx != -1 {
-					// case 2: the leader has the term
-					rf.nextIndex[pId] = nextIdx
-					rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) FOLLOWER (S%d) MISMATCH PREV TERM! (FOUNDED)! nextIndex[S%d]=%d\n\tlen(logs)=%d\n\treply=%+v", pId, pId, nextIdx, len(rf.logs), reply))
-				} else {
-					// case 1: the leader doesn't have the term
+				if iRel != -1 { // leader has XTerm
+					Debugf(dLog2, "S%v -> S%v, A, nextIndex [%v] -> [%v]\n", rf.me, pId, rf.nextIndex[pId], iRel)
+					rf.nextIndex[pId] = rf.GetAbsoluteIndex(iRel)
+				} else { // leader doesn't have XTerm
+					Debugf(dLog2, "S%v -> S%v, B, nextIndex [%v] -> [%v]\n", rf.me, pId, rf.nextIndex[pId], reply.XIndex)
 					rf.nextIndex[pId] = reply.XIndex
-					rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) FOLLOWER (S%d) MISMATCH PREV TERM! (NOT_FOUNDED)! nextIndex[S%d]=%d len(logs)=%d, reply=%+v", pId, pId, reply.XIndex, rf.XIndex+len(rf.logs), reply))
 				}
 
+			} else if reply.XLen != -1 { // rejected because follower log shorter
+				Debugf(dLog2, "S%v -> S%v, C, nextIndex [%v] -> [%v]\n", rf.me, pId, rf.nextIndex[pId], reply.XLen)
+				rf.nextIndex[pId] = reply.XLen
+			} else { // else rejected for term mismatch, could be stale
+				rf.nextIndex[pId] = rf.nextIndex[pId] - 1
 			}
-			rf.logger.Log(LogTopicSyncEntries, fmt.Sprintf("(sendEntry) NEW INDICES FOR S%d ; (nextIndex[S%d]=%d, matchIndex[S%d]=%d) myLastLogIndex=%d", pId, pId, rf.nextIndex[pId], pId, rf.matchIndex[pId], len(rf.logs)-1))
+
+			Debugf(dLog2, "S%v -> S%v, syncLogEntries rejected, attempting nextIndex [%v], lastLogIndex [%v]\n", rf.me, pId, rf.nextIndex[pId], rf.GetAbsoluteIndex(len(rf.log)-1))
 		}
-	}()
+		rf.mu.Unlock()
+
+		if reply.Success {
+			rf.commitEntries(term)
+		}
+	}
+}
+
+// commitEntries commits all uncommited entry in the leader's log
+func (rf *Raft) commitEntries(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.applying {
+		Debugf(dCommit, "S%v already applying, aborting\n", rf.me)
+		return
+	}
+
+	if term < rf.currTerm || rf.raftState != Leader {
+		Debugf(dLog2, "S%v commitEntries not counting, currTerm %v > initialTerm %v OR state %v != leader\n", rf.me, term, rf.currTerm, rf.raftState)
+	}
+
+	maxMatchIdx := -1
+	majorityCount := make(map[int]int, 0)
+	for _, mIdx := range rf.matchIndex {
+
+		if rf.GetRelativeIndex(mIdx) < 0 {
+			continue
+		}
+
+		if mIdx == 0 || rf.log[rf.GetRelativeIndex(mIdx)].Term != rf.currTerm {
+			continue
+		}
+		majorityCount[mIdx] += 1
+		maxMatchIdx = Max(maxMatchIdx, mIdx)
+	}
+
+	majorityThrsh := len(rf.peers) / 2
+
+	highestIdx := -1
+	for N := maxMatchIdx; N >= 0; N -= 1 {
+		if cnt, ok := majorityCount[N]; ok && cnt >= majorityThrsh {
+			highestIdx = N
+			break
+		}
+	}
+
+	Debugf(dCommit, "S%v counting complete, highest agreed [%v] by majority %+v of %v\n", rf.me, highestIdx, majorityCount, len(rf.peers))
+
+	rf.applying = true
+
+	if highestIdx != -1 && rf.lastApplied+1 <= highestIdx && highestIdx > rf.commitIndex && highestIdx < rf.GetAbsoluteIndex(len(rf.log)) {
+		if len(rf.log) < 10 {
+			Debugf(dCommit, "S%v leader begin applying commands [%v] to [%v], log: %v\n", rf.me, rf.lastApplied+1, highestIdx, rf.log)
+		} else {
+			last5Idx := len(rf.log) - 6
+			Debugf(dCommit, "S%v leader begin applying commands [%v] to [%v], log[-5:]: %v\n", rf.me, rf.lastApplied+1, highestIdx, rf.log[last5Idx:])
+		}
+		startIndex := rf.lastApplied + 1
+		for iAbs := startIndex; iAbs <= highestIdx; iAbs++ {
+			Debugf(dCommit, "S%v applying at [%v], {%v %v} \n", rf.me, iAbs, term, rf.log[rf.GetRelativeIndex(iAbs)].Command)
+			command := rf.log[rf.GetRelativeIndex(iAbs)].Command
+			Debugf(dCommit, "S%v lastApplied: %v, commitIndex: %v before applying \n", rf.me, rf.lastApplied, rf.commitIndex)
+			rf.mu.Unlock()
+
+			rf.applyCh <- ApplyMsg{
+				CommandValid:  true,
+				Command:       command,
+				CommandIndex:  iAbs,
+				SnapshotValid: false,
+				Snapshot:      []byte{},
+				SnapshotTerm:  term,
+				SnapshotIndex: 0,
+			}
+
+			rf.mu.Lock()
+			rf.lastApplied = iAbs
+			rf.commitIndex = iAbs
+			Debugf(dCommit, "S%v lastApplied: %v, commitIndex: %v after applying \n", rf.me, rf.lastApplied, rf.commitIndex)
+		}
+
+		Debugf(dCommit, "S%v applied indices up to [%v], lastApplied %v, commitIndex %v\n", rf.me, highestIdx, rf.lastApplied, rf.commitIndex)
+		rf.cond.Broadcast()
+	}
+
+	rf.applying = false
 }
