@@ -4,6 +4,7 @@ import (
 	"cpsc416/labgob"
 	"cpsc416/labrpc"
 	"cpsc416/raft"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
+	logger          *Logger
 	dead            int32 // set by Kill()
 	lastClientCalls map[int64]int64
 	clientReqs      map[int64]chan Op
@@ -93,7 +95,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 	sc.mu.Lock()
 	if _, isLeader := sc.rf.GetState(); !isLeader {
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected PutAppend request on key %s as it's not the leader", sc.me, args.Key))
+		sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected Join request as it's not the leader", sc.me))
 		reply.WrongLeader = true
 		sc.mu.Unlock()
 		return
@@ -104,24 +106,24 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.rf.Start(op)
 	sc.mu.Unlock()
 
-	// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started PutAppend (%s) request for key %s from C%d", sc.me, args.Op, args.Key, args.ClerkId))
+	sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started Join from C%d", sc.me, args.ClientId))
 
 	timer := time.NewTimer(WaitTimeOut)
 	defer timer.Stop()
 
 	select {
 	case <-timer.C: // on time out
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on PutAppend request for key %s", sc.me, args.Key))
+		sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on Join request", sc.me))
 		reply.Err = ErrTimeOut
 		return
 	case resultOp := <-ch:
 		// Check if the operation result corresponds to the original request.
 		if resultOp.ClientId != args.ClientId || resultOp.RequestId != args.RequestId {
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for PutAppend request on key %s", sc.me, args.Key))
+			sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for Join request", sc.me))
 			reply.WrongLeader = true
 		} else {
 			reply.Err = OK
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed PutAppend request for key %s", sc.me, args.Key))
+			sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed Join request", sc.me))
 
 		}
 	}
@@ -290,11 +292,16 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 // form the fault-tolerant shardctrler service.
 // me is the index of the current server in servers[].
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
+	logger, err := NewLogger(1)
+	if err != nil {
+		fmt.Println("Couldn't open the log file", err)
+	}
 	sc := new(ShardCtrler)
 	sc.me = me
 
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
+	sc.logger = logger
 
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
@@ -307,6 +314,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.lastClientCalls = make(map[int64]int64)
 	sc.clientReqs = make(map[int64]chan Op)
 
+	go sc.ReadApplyMessages()
 	return sc
 }
 
@@ -337,7 +345,11 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		// divide shards evenly among all groups with as little movement as possible (move shards from prev groups to new groups)
 		var newShards [NShards]int
 		newShardsPerGroup := NShards / newNumGroups
-		oldShardsPerGroup := NShards / numGroups
+		oldShardsPerGroup := 0
+		if numGroups != 0 {
+			oldShardsPerGroup = NShards / numGroups
+		}
+
 		shardsToBeMovedPerOldGroup := oldShardsPerGroup - newShardsPerGroup
 		counts := make(map[int]int)
 		counts_new := make(map[int]int)
@@ -398,6 +410,14 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		}
 		// divides shards evenly among the remaining groups with as few moves as possible
 		var newShards [NShards]int
+		if newNumGroups == 0 {
+			newConfigNum := sc.lastConfigNum + 1
+			//now assign the new config
+			newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
+			sc.configs = append(sc.configs, newConfig)
+			sc.lastConfigNum++
+			break
+		}
 		newShardsPerGroup := int(math.Ceil(float64(NShards) / float64(newNumGroups)))
 		oldShardsPerGroup := NShards / numGroups
 		shardsToBeAddedPerGroup := newShardsPerGroup - oldShardsPerGroup
