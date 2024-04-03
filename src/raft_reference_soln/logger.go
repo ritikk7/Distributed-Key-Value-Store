@@ -19,6 +19,9 @@ const (
 	LogTopicStartCmd
 	LogTopicElection
 	LogTopicHeartbeat
+	LogTopicSnapshots
+	LogTopicInstallSnapshotRPC
+	LogTopicSendInstallSnapshot
 )
 const TermColor string = "\x1b[0m"
 
@@ -92,13 +95,19 @@ func (l *Logger) topicToString(topic LogTopic) (string, string) {
 	case LogTopicLogUpdateApe:
 		return "APNDE_LOG_UPDATE", "\x1b[91m" // Light red color
 	case LogTopicAppendEntryRpc:
-		return "APNDE", "\x1b[92m" // Light green color
+		return "APNDE_RPC", "\x1b[92m" // Light green color
 	case LogTopicStartCmd:
-		return "START", "\x1b[93m" // Light yellow color
+		return "START_RPC", "\x1b[93m" // Light yellow color
 	case LogTopicElection:
 		return "ELECTION", "\x1b[94m" // Light blue color
 	case LogTopicHeartbeat:
 		return "HEART_BEAT", "\x1b[95m" // Light magenta color
+	case LogTopicSnapshots:
+		return "SNAPSHOT_RPC", "\x1b[94m" // Light blue color
+	case LogTopicInstallSnapshotRPC:
+		return "INSTALL_SNAPSHOT_RPC", "\x1b[94m"
+	case LogTopicSendInstallSnapshot:
+		return "SENDING_INSTALL_SNP", "\x1b[94m"
 	default:
 		return "MISC", "\x1b[97m" // Bright white color
 	}
