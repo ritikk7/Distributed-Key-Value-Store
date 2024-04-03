@@ -1,5 +1,7 @@
 package shardctrler
 
+import "time"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -31,13 +33,20 @@ type Config struct {
 const (
 	JOIN  = "Join"
 	LEAVE = "Leave"
+	MOVE  = "Move"
+	QUERY = "Query"
 )
 
 const (
-	OK = "OK"
+	OK         = "OK"
+	ErrTimeOut = "ErrTimeOut"
 )
 
 type Err string
+
+const WaitTimeOut = 2000 * time.Millisecond
+
+const Debug = false
 
 type JoinArgs struct {
 	Servers   map[int][]string // new GID -> servers mappings
