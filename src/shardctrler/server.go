@@ -310,6 +310,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	sc.configs[0].Num = 0
 	sc.configs[0].Groups = make(map[int][]string)
+	for i := 0; i < NShards; i++ {
+		sc.configs[0].Shards[i] = -1
+	}
 	// sc.configs[0].Shards = make([]int, NShards)
 	sc.lastClientCalls = make(map[int64]int64)
 	sc.clientReqs = make(map[int64]chan Op)
@@ -345,7 +348,7 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		// divide shards evenly among all groups with as little movement as possible (move shards from prev groups to new groups)
 		var newShards [NShards]int
 		newShardsPerGroup := NShards / newNumGroups
-		oldShardsPerGroup := 0
+		oldShardsPerGroup := NShards + 1
 		if numGroups != 0 {
 			oldShardsPerGroup = NShards / numGroups
 		}
@@ -354,6 +357,21 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		counts := make(map[int]int)
 		counts_new := make(map[int]int)
 		for i := 0; i < NShards; i++ {
+			if sc.configs[sc.lastConfigNum].Shards[i] == -1 {
+				for currNew := range opResult.Servers {
+					_, hasCount := counts_new[currNew]
+					if !hasCount {
+						counts_new[currNew] = 0
+					}
+					count := counts_new[currNew]
+					if count < newShardsPerGroup {
+						counts_new[currNew]++
+						newShards[i] = currNew
+						break
+					}
+				}
+				continue
+			}
 			currOld := sc.configs[sc.lastConfigNum].Shards[i]
 			_, ok := counts[currOld]
 			if !ok {
@@ -362,13 +380,13 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 			val := counts[currOld]
 			if val < shardsToBeMovedPerOldGroup {
 				counts[currOld]++
-				for currNew, _ := range opResult.Servers {
+				for currNew := range opResult.Servers {
 					_, hasCount := counts_new[currNew]
 					if !hasCount {
 						counts_new[currNew] = 0
 					}
 					count := counts_new[currNew]
-					if count < shardsToBeMovedPerOldGroup {
+					if count < newShardsPerGroup {
 						counts_new[currNew]++
 						newShards[i] = currNew
 						break
