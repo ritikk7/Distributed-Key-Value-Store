@@ -5,7 +5,6 @@ import (
 	"cpsc416/labrpc"
 	"cpsc416/raft"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -311,7 +310,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.configs[0].Num = 0
 	sc.configs[0].Groups = make(map[int][]string)
 	for i := 0; i < NShards; i++ {
-		sc.configs[0].Shards[i] = -1
+		sc.configs[0].Shards[i] = 0
 	}
 	// sc.configs[0].Shards = make([]int, NShards)
 	sc.lastClientCalls = make(map[int64]int64)
@@ -331,15 +330,13 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 
 		// copy old groups (that have not been removed) into new group
 		for gid, servers := range oldGIDs {
-			if len(servers) != 0 {
-				numGroups++
-				newGIDs[gid] = servers
-			}
+			numGroups++
+			newGIDs[gid] = servers
 		}
 		newNumGroups := numGroups
 		for gid, servers := range opResult.Servers {
-			val, ok := oldGIDs[gid]
-			if !ok || len(val) == 0 {
+			_, ok := oldGIDs[gid]
+			if !ok {
 				// that means that this has not been assigned before or is currently not in use
 				newNumGroups++
 				newGIDs[gid] = servers
@@ -357,14 +354,14 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		counts := make(map[int]int)
 		counts_new := make(map[int]int)
 		for i := 0; i < NShards; i++ {
-			if sc.configs[sc.lastConfigNum].Shards[i] == -1 {
+			if sc.configs[sc.lastConfigNum].Shards[i] == 0 {
 				for currNew := range opResult.Servers {
 					_, hasCount := counts_new[currNew]
 					if !hasCount {
 						counts_new[currNew] = 0
 					}
 					count := counts_new[currNew]
-					if count < newShardsPerGroup {
+					if count < newShardsPerGroup+1 {
 						counts_new[currNew]++
 						newShards[i] = currNew
 						break
@@ -386,7 +383,7 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 						counts_new[currNew] = 0
 					}
 					count := counts_new[currNew]
-					if count < newShardsPerGroup {
+					if count < newShardsPerGroup+1 {
 						counts_new[currNew]++
 						newShards[i] = currNew
 						break
@@ -407,38 +404,24 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 		// make a new configuration without given replica groups
 		oldGIDs := sc.configs[sc.lastConfigNum].Groups
 		newGIDs := make(map[int][]string)
-		numGroups := 0
+		// numGroups := 0
 		newNumGroups := 0
 		// copy old groups (that will not be removed)
 		for gid, servers := range oldGIDs {
-			if len(servers) != 0 {
-				toBeRemoved := false
-				numGroups++
-				for _, rGid := range opResult.GIDs {
-					if gid == rGid {
-						toBeRemoved = true
-						break
-					}
+			toBeRemoved := false
+			for _, rGid := range opResult.GIDs {
+				if gid == rGid {
+					toBeRemoved = true
+					break
 				}
-				if !toBeRemoved && len(servers) > 0 {
-					newGIDs[gid] = servers
-					newNumGroups++
-				}
+			}
+			if !toBeRemoved && len(servers) > 0 {
+				newGIDs[gid] = servers
+				newNumGroups++
 			}
 		}
 		// divides shards evenly among the remaining groups with as few moves as possible
 		var newShards [NShards]int
-		if newNumGroups == 0 {
-			newConfigNum := sc.lastConfigNum + 1
-			//now assign the new config
-			newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
-			sc.configs = append(sc.configs, newConfig)
-			sc.lastConfigNum++
-			break
-		}
-		newShardsPerGroup := int(math.Ceil(float64(NShards) / float64(newNumGroups)))
-		oldShardsPerGroup := NShards / numGroups
-		shardsToBeAddedPerGroup := newShardsPerGroup - oldShardsPerGroup
 		counts_remaining := make(map[int]int)
 		for i := 0; i < NShards; i++ {
 			currOld := sc.configs[sc.lastConfigNum].Shards[i]
@@ -446,31 +429,61 @@ func (sc *ShardCtrler) applyOperation(opResult Op) {
 			for _, rGid := range opResult.GIDs {
 				if currOld == rGid {
 					kept = false
+					newShards[i] = 0
 					break
 				}
 			}
-			if !kept {
-				for remGID, _ := range newGIDs {
-					_, ok := counts_remaining[remGID]
-					if !ok {
-						counts_remaining[remGID] = 0
-					}
-					val := counts_remaining[remGID]
-					if val < shardsToBeAddedPerGroup {
-						counts_remaining[remGID]++
-						newShards[i] = remGID
+			if kept {
+				newShards[i] = currOld
+				counts_remaining[sc.configs[sc.lastConfigNum].Shards[i]]++
+			}
+		}
+		if newNumGroups == 0 {
+			newConfigNum := sc.lastConfigNum + 1
+			newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
+			sc.configs = append(sc.configs, newConfig)
+			sc.lastConfigNum++
+			break
+		}
+		newShardsPerGroup := NShards / newNumGroups
+		for i := 0; i < NShards; i++ {
+			if newShards[i] == 0 {
+				for gid := range newGIDs {
+					if counts_remaining[gid] < newShardsPerGroup {
+						newShards[i] = gid
+						counts_remaining[gid]++
 						break
 					}
 				}
-			} else {
-				newShards[i] = currOld
 			}
 		}
-		newConfigNum := sc.lastConfigNum + 1
+
 		//now assign the new config
+		newConfigNum := sc.lastConfigNum + 1
 		newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
 		sc.configs = append(sc.configs, newConfig)
 		sc.lastConfigNum++
-
+	case MOVE:
+		// make a new configuration with given replica group
+		oldGIDs := sc.configs[sc.lastConfigNum].Groups
+		newGIDs := make(map[int][]string)
+		for gid, servers := range oldGIDs {
+			newGIDs[gid] = servers
+		}
+		var newShards [NShards]int
+		for i := 0; i < NShards; i++ {
+			if i == opResult.Shard {
+				newShards[i] = opResult.GID
+			} else {
+				newShards[i] = sc.configs[sc.lastConfigNum].Shards[i]
+			}
+		}
+		//now assign the new config
+		newConfigNum := sc.lastConfigNum + 1
+		newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
+		sc.configs = append(sc.configs, newConfig)
+		sc.lastConfigNum++
+	case QUERY:
+		// no state change for query
 	}
 }
