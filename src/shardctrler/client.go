@@ -1,58 +1,51 @@
 package shardctrler
 
-//
-// Shardctrler clerk.
-//
-
 import (
 	"cpsc416/labrpc"
 	"crypto/rand"
 	"fmt"
 	"math/big"
-	// "time"
 )
 
+// Clerk represents a client interacting with the ShardCtrler service.
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
-	// leaderId  int32 // Store the ID of the leader to try it first
-	clientId  int64 // Unique client ID
-	requestId int64 // Unique request ID for each request
-	leaderId  int64
-	logger    *Logger
+	servers   []*labrpc.ClientEnd // RPC endpoints of all servers
+	clientId  int64               // Unique identifier for this client
+	requestId int64               // Monotonic counter for requests
+	leaderId  int64               // Best guess of current leader
+	logger    *Logger             // Optional logger for debugging
 }
 
+// Generates a random 62-bit integer.
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
+	randVal, _ := rand.Int(rand.Reader, max)
+	return randVal.Int64()
 }
 
+// MakeClerk creates a new Clerk instance.
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	logger, err := NewLogger(1)
 	if err != nil {
 		fmt.Println("Couldn't open the log file", err)
 	}
-	ck := new(Clerk)
-	ck.servers = servers
-	// Your code here.
-	ck.clientId = nrand()
-	ck.requestId = 0
-	ck.logger = logger
-	// fmt.Println("made a clerk")
-	return ck
+	return &Clerk{
+		servers:   servers,
+		clientId:  nrand(),
+		requestId: 0,
+		logger:    logger,
+	}
 }
 
+// Query fetches the configuration with the given number (or latest if num == -1).
 func (ck *Clerk) Query(num int) Config {
 	ck.requestId++
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
-	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
+	args := &QueryArgs{
+		Num:       num,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
@@ -60,84 +53,67 @@ func (ck *Clerk) Query(num int) Config {
 				return reply.Config
 			}
 		}
-		// time.Sleep(100 * time.Millisecond)
 	}
 }
 
+// Join requests to add a new group of servers to the configuration.
 func (ck *Clerk) Join(servers map[int][]string) {
-	// fmt.Println("called a join")
 	ck.logger.Log(LogTopicClerk, fmt.Sprintf("[JOIN] to server from %d", ck.clientId))
 	ck.requestId++
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
-	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
+	args := &JoinArgs{
+		Servers:   servers,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
 	for {
 		var reply JoinReply
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Join", args, &reply)
-		if ok {
-			if reply.Err == OK {
-				return
-			}
-			if reply.WrongLeader {
-				ck.cycleThroughLeaders()
-			}
-		} else {
-			ck.cycleThroughLeaders()
+		if ok && reply.Err == OK {
+			return
 		}
+		ck.cycleThroughLeaders()
 	}
 }
 
+// Leave requests to remove a set of groups from the configuration.
 func (ck *Clerk) Leave(gids []int) {
 	ck.requestId++
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
-	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-
-	// try each known server.
+	args := &LeaveArgs{
+		GIDs:      gids,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
 	for {
 		var reply LeaveReply
 		ok := ck.servers[ck.leaderId].Call("ShardCtrler.Leave", args, &reply)
-		if ok {
-			if reply.Err == OK {
-				return
-			}
-			if reply.WrongLeader {
-				ck.cycleThroughLeaders()
-			}
-		} else {
-			ck.cycleThroughLeaders()
+		if ok && reply.Err == OK {
+			return
 		}
+		ck.cycleThroughLeaders()
 	}
-	// time.Sleep(100 * time.Millisecond)
 }
 
+// Move assigns a specific shard to a particular group.
 func (ck *Clerk) Move(shard int, gid int) {
 	ck.requestId++
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
-	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-
+	args := &MoveArgs{
+		Shard:     shard,
+		GID:       gid,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false && reply.Err != ErrTimeOut {
+			if ok && !reply.WrongLeader && reply.Err != ErrTimeOut {
 				return
 			}
 		}
-		// time.Sleep(100 * time.Millisecond)
 	}
 }
 
+// cycleThroughLeaders moves to the next known server as the presumed leader.
 func (ck *Clerk) cycleThroughLeaders() {
-	ck.leaderId++
-	ck.leaderId %= int64(len(ck.servers))
+	ck.leaderId = (ck.leaderId + 1) % int64(len(ck.servers))
 }
