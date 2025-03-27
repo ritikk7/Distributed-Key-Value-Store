@@ -1,3 +1,4 @@
+// Refactored shardctrler/server.go for readability and maintainability
 package shardctrler
 
 import (
@@ -5,485 +6,303 @@ import (
 	"cpsc416/labrpc"
 	"cpsc416/raft"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type ShardCtrler struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+// ==============================
+// Structs and Types
+// ==============================
 
-	// Your data here.
+type ShardCtrler struct {
+	mu              sync.Mutex
+	me              int
+	rf              *raft.Raft
+	applyCh         chan raft.ApplyMsg
 	logger          *Logger
-	dead            int32 // set by Kill()
-	lastClientCalls map[int64]int64
-	clientReqs      map[int64]chan Op
-	lastConfigNum   int
-	configs         []Config // indexed by config num
+	dead            int32
+	lastSeenRequest map[int64]int64
+	pendingOps      map[int64]chan Op
+	configs         []Config
 	lastApplied     int
 }
 
 type Op struct {
-	// Your data here.
 	Type      string
 	ClientId  int64
 	RequestId int64
-	// join
-	Servers map[int][]string
-	// leave
-	GIDs []int
-	// move
-	Shard int
-	GID   int
-	// query
-	Num int
+	Servers   map[int][]string
+	GIDs      []int
+	Shard     int
+	GID       int
+	Num       int
+}
+
+// ==============================
+// Lifecycle
+// ==============================
+
+func (sc *ShardCtrler) Kill() {
+	atomic.StoreInt32(&sc.dead, 1)
+	sc.rf.Kill()
 }
 
 func (sc *ShardCtrler) killed() bool {
-	z := atomic.LoadInt32(&sc.dead)
-	return z == 1
+	return atomic.LoadInt32(&sc.dead) == 1
 }
 
-func (sc *ShardCtrler) ReadApplyMessages() {
+func (sc *ShardCtrler) Raft() *raft.Raft {
+	return sc.rf
+}
+
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
+	logger, err := NewLogger(1)
+	if err != nil {
+		fmt.Println("Couldn't open the log file", err)
+	}
+
+	sc := &ShardCtrler{
+		me:              me,
+		logger:          logger,
+		applyCh:         make(chan raft.ApplyMsg),
+		lastSeenRequest: make(map[int64]int64),
+		pendingOps:      make(map[int64]chan Op),
+		configs:         make([]Config, 1),
+	}
+
+	sc.configs[0] = Config{Num: 0, Groups: map[int][]string{}}
+	for i := range sc.configs[0].Shards {
+		sc.configs[0].Shards[i] = 0
+	}
+
+	labgob.Register(Op{})
+	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
+	go sc.runApplyLoop()
+	return sc
+}
+
+// ==============================
+// RPC Helpers
+// ==============================
+
+func (sc *ShardCtrler) startOpAndWait(op Op, clientId int64) (Op, bool) {
+	sc.mu.Lock()
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		sc.mu.Unlock()
+		return Op{}, false
+	}
+
+	ch := make(chan Op, 1)
+	sc.pendingOps[clientId] = ch
+	sc.rf.Start(op)
+	sc.mu.Unlock()
+
+	timer := time.NewTimer(WaitTimeOut)
+	defer timer.Stop()
+
+	select {
+	case result := <-ch:
+		if result.ClientId == op.ClientId && result.RequestId == op.RequestId {
+			return result, true
+		}
+		return Op{}, false
+	case <-timer.C:
+		return Op{}, false
+	}
+}
+
+// ==============================
+// RPC Handlers
+// ==============================
+
+func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
+	op := Op{Type: JOIN, ClientId: args.ClientId, RequestId: args.RequestId, Servers: args.Servers}
+	_, ok := sc.startOpAndWait(op, args.ClientId)
+	if !ok {
+		reply.WrongLeader = true
+		reply.Err = ErrTimeOut
+		return
+	}
+	reply.Err = OK
+}
+
+func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
+	op := Op{Type: LEAVE, ClientId: args.ClientId, RequestId: args.RequestId, GIDs: args.GIDs}
+	_, ok := sc.startOpAndWait(op, args.ClientId)
+	if !ok {
+		reply.WrongLeader = true
+		reply.Err = ErrTimeOut
+		return
+	}
+	reply.Err = OK
+}
+
+func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
+	op := Op{Type: MOVE, ClientId: args.ClientId, RequestId: args.RequestId, Shard: args.Shard, GID: args.GID}
+	_, ok := sc.startOpAndWait(op, args.ClientId)
+	if !ok {
+		reply.WrongLeader = true
+		reply.Err = ErrTimeOut
+		return
+	}
+	reply.Err = OK
+}
+
+func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
+	op := Op{Type: QUERY, ClientId: args.ClientId, RequestId: args.RequestId, Num: args.Num}
+	_, ok := sc.startOpAndWait(op, args.ClientId)
+	if !ok {
+		reply.WrongLeader = true
+		reply.Err = ErrTimeOut
+		return
+	}
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if args.Num == -1 || args.Num >= len(sc.configs) {
+		reply.Config = sc.configs[len(sc.configs)-1]
+	} else {
+		reply.Config = sc.configs[args.Num]
+	}
+	reply.Err = OK
+}
+
+// ==============================
+// Raft Apply Loop
+// ==============================
+
+func (sc *ShardCtrler) runApplyLoop() {
 	for !sc.killed() {
-		msg := <-sc.applyCh // wait for a message from Raft
+		msg := <-sc.applyCh
 		if msg.CommandValid {
 			sc.mu.Lock()
 			if msg.CommandIndex <= sc.lastApplied {
 				sc.mu.Unlock()
 				continue
 			}
-
 			op := msg.Command.(Op)
-
-			// check if the operation is the latest from the clerk
-			lastSeq, found := sc.lastClientCalls[op.ClientId]
-			if !found || lastSeq < op.RequestId {
-				// apply the operation to the state machine
+			lastSeen, seen := sc.lastSeenRequest[op.ClientId]
+			if !seen || op.RequestId > lastSeen {
 				sc.applyOperation(op)
-				sc.lastClientCalls[op.RequestId] = op.RequestId
+				sc.lastSeenRequest[op.ClientId] = op.RequestId
 			}
-
-			// notify the waiting goroutine if it's present
-			if ch, ok := sc.clientReqs[op.ClientId]; ok {
+			if ch, ok := sc.pendingOps[op.ClientId]; ok {
 				select {
-				case ch <- op: // notify the waiting goroutine
-					// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d notified the goroutine for ClerkId %d", sc.me, op.ClerkId))
+				case ch <- op:
 				default:
-					// if the channel is already full, skip to prevent blocking.
-
 				}
 			}
-
 			sc.lastApplied = msg.CommandIndex
 			sc.mu.Unlock()
 		}
 	}
 }
 
-func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	op := Op{
-		Type:      JOIN, // Put Append
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		Servers:   args.Servers,
-	}
+// ==============================
+// Operation Application
+// ==============================
 
-	sc.mu.Lock()
-	if _, isLeader := sc.rf.GetState(); !isLeader {
-		sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected Join request as it's not the leader", sc.me))
-		reply.WrongLeader = true
-		sc.mu.Unlock()
-		return
-	}
-
-	ch := make(chan Op, 1)
-	sc.clientReqs[args.ClientId] = ch
-	sc.rf.Start(op)
-	sc.mu.Unlock()
-
-	sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started Join from C%d", sc.me, args.ClientId))
-
-	timer := time.NewTimer(WaitTimeOut)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C: // on time out
-		sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on Join request", sc.me))
-		reply.Err = ErrTimeOut
-		return
-	case resultOp := <-ch:
-		// Check if the operation result corresponds to the original request.
-		if resultOp.ClientId != args.ClientId || resultOp.RequestId != args.RequestId {
-			sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for Join request", sc.me))
-			reply.WrongLeader = true
-		} else {
-			reply.Err = OK
-			sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed Join request", sc.me))
-
-		}
-	}
-
-}
-
-func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	op := Op{
-		Type:      LEAVE, // Put Append
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		GIDs:      args.GIDs,
-	}
-
-	sc.mu.Lock()
-	if _, isLeader := sc.rf.GetState(); !isLeader {
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected PutAppend request on key %s as it's not the leader", sc.me, args.Key))
-		reply.WrongLeader = true
-		sc.mu.Unlock()
-		return
-	}
-
-	ch := make(chan Op, 1)
-	sc.clientReqs[args.ClientId] = ch
-	sc.rf.Start(op)
-	sc.mu.Unlock()
-
-	// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started PutAppend (%s) request for key %s from C%d", sc.me, args.Op, args.Key, args.ClerkId))
-
-	timer := time.NewTimer(WaitTimeOut)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C: // on time out
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on PutAppend request for key %s", sc.me, args.Key))
-		reply.Err = ErrTimeOut
-		return
-	case resultOp := <-ch:
-		// Check if the operation result corresponds to the original request.
-		if resultOp.ClientId != args.ClientId || resultOp.RequestId != args.RequestId {
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for PutAppend request on key %s", sc.me, args.Key))
-			reply.WrongLeader = true
-		} else {
-			reply.Err = OK
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed PutAppend request for key %s", sc.me, args.Key))
-
-		}
-	}
-}
-
-func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
-	op := Op{
-		Type:      MOVE, // Put Append
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		Shard:     args.Shard,
-		GID:       args.GID,
-	}
-
-	sc.mu.Lock()
-	if _, isLeader := sc.rf.GetState(); !isLeader {
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected PutAppend request on key %s as it's not the leader", sc.me, args.Key))
-		reply.WrongLeader = true
-		sc.mu.Unlock()
-		return
-	}
-
-	ch := make(chan Op, 1)
-	sc.clientReqs[args.ClientId] = ch
-	sc.rf.Start(op)
-	sc.mu.Unlock()
-
-	// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started PutAppend (%s) request for key %s from C%d", sc.me, args.Op, args.Key, args.ClerkId))
-
-	timer := time.NewTimer(WaitTimeOut)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C: // on time out
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on PutAppend request for key %s", sc.me, args.Key))
-		reply.Err = ErrTimeOut
-		return
-	case resultOp := <-ch:
-		// Check if the operation result corresponds to the original request.
-		if resultOp.ClientId != args.ClientId || resultOp.RequestId != args.RequestId {
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for PutAppend request on key %s", sc.me, args.Key))
-			reply.WrongLeader = true
-		} else {
-			reply.Err = OK
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed PutAppend request for key %s", sc.me, args.Key))
-
-		}
-	}
-}
-
-func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
-	op := Op{
-		Type:      QUERY, // Put Append
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		Num:       args.Num,
-	}
-
-	sc.mu.Lock()
-	if _, isLeader := sc.rf.GetState(); !isLeader {
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d rejected PutAppend request on key %s as it's not the leader", sc.me, args.Key))
-		reply.WrongLeader = true
-		sc.mu.Unlock()
-		return
-	}
-
-	ch := make(chan Op, 1)
-	sc.clientReqs[args.ClientId] = ch
-	sc.rf.Start(op)
-	sc.mu.Unlock()
-
-	// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d started PutAppend (%s) request for key %s from C%d", sc.me, args.Op, args.Key, args.ClerkId))
-
-	timer := time.NewTimer(WaitTimeOut)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C: // on time out
-		// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d timed out on PutAppend request for key %s", sc.me, args.Key))
-		reply.Err = ErrTimeOut
-		return
-	case resultOp := <-ch:
-		// Check if the operation result corresponds to the original request.
-		if resultOp.ClientId != args.ClientId || resultOp.RequestId != args.RequestId {
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d received non-matching result for PutAppend request on key %s", sc.me, args.Key))
-			reply.WrongLeader = true
-		} else {
-			sc.mu.Lock()
-			if args.Num >= len(sc.configs) || args.Num == -1 {
-				reply.Config = sc.configs[len(sc.configs)-1]
-			} else {
-				reply.Config = sc.configs[args.Num]
-			}
-			reply.Err = OK
-			sc.mu.Unlock()
-			// sc.logger.Log(LogTopicServer, fmt.Sprintf("S%d successfully completed PutAppend request for key %s", sc.me, args.Key))
-
-		}
-	}
-}
-
-// the tester calls Kill() when a ShardCtrler instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-func (sc *ShardCtrler) Kill() {
-	atomic.StoreInt32(&sc.dead, 1)
-	sc.rf.Kill()
-	// Your code here, if desired.
-}
-
-// needed by shardsc tester
-func (sc *ShardCtrler) Raft() *raft.Raft {
-	return sc.rf
-}
-
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant shardctrler service.
-// me is the index of the current server in servers[].
-func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
-	logger, err := NewLogger(1)
-	if err != nil {
-		fmt.Println("Couldn't open the log file", err)
-	}
-	sc := new(ShardCtrler)
-	sc.me = me
-
-	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
-	sc.logger = logger
-
-	labgob.Register(Op{})
-	sc.applyCh = make(chan raft.ApplyMsg)
-	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
-
-	// Your code here.
-	sc.configs[0].Num = 0
-	sc.configs[0].Groups = make(map[int][]string)
-	for i := 0; i < NShards; i++ {
-		sc.configs[0].Shards[i] = 0
-	}
-	// sc.configs[0].Shards = make([]int, NShards)
-	sc.lastClientCalls = make(map[int64]int64)
-	sc.clientReqs = make(map[int64]chan Op)
-
-	go sc.ReadApplyMessages()
-	return sc
-}
-
-func (sc *ShardCtrler) applyOperation(opResult Op) {
-	switch opResult.Type {
+func (sc *ShardCtrler) applyOperation(op Op) {
+	switch op.Type {
 	case JOIN:
-		// make a new configuration with new replica groups
-		oldGIDs := sc.configs[sc.lastConfigNum].Groups
-		newGIDs := make(map[int][]string)
-		numGroups := 0
-
-		// copy old groups (that have not been removed) into new group
-		for gid, servers := range oldGIDs {
-			numGroups++
-			newGIDs[gid] = servers
-		}
-		newNumGroups := numGroups
-		for gid, servers := range opResult.Servers {
-			_, ok := oldGIDs[gid]
-			if !ok {
-				// that means that this has not been assigned before or is currently not in use
-				newNumGroups++
-				newGIDs[gid] = servers
-			}
-		}
-		// divide shards evenly among all groups with as little movement as possible (move shards from prev groups to new groups)
-		var newShards [NShards]int
-		newShardsPerGroup := NShards / newNumGroups
-		oldShardsPerGroup := NShards + 1
-		if numGroups != 0 {
-			oldShardsPerGroup = NShards / numGroups
-		}
-
-		shardsToBeMovedPerOldGroup := oldShardsPerGroup - newShardsPerGroup
-		counts := make(map[int]int)
-		counts_new := make(map[int]int)
-		for i := 0; i < NShards; i++ {
-			if sc.configs[sc.lastConfigNum].Shards[i] == 0 {
-				for currNew := range opResult.Servers {
-					_, hasCount := counts_new[currNew]
-					if !hasCount {
-						counts_new[currNew] = 0
-					}
-					count := counts_new[currNew]
-					if count < newShardsPerGroup+1 {
-						counts_new[currNew]++
-						newShards[i] = currNew
-						break
-					}
-				}
-				continue
-			}
-			currOld := sc.configs[sc.lastConfigNum].Shards[i]
-			_, ok := counts[currOld]
-			if !ok {
-				counts[currOld] = 0
-			}
-			val := counts[currOld]
-			if val < shardsToBeMovedPerOldGroup {
-				counts[currOld]++
-				for currNew := range opResult.Servers {
-					_, hasCount := counts_new[currNew]
-					if !hasCount {
-						counts_new[currNew] = 0
-					}
-					count := counts_new[currNew]
-					if count < newShardsPerGroup+1 {
-						counts_new[currNew]++
-						newShards[i] = currNew
-						break
-					}
-				}
-			} else {
-				newShards[i] = currOld
-			}
-
-		}
-		newConfigNum := sc.lastConfigNum + 1
-		//now assign the new config
-		newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
-		sc.configs = append(sc.configs, newConfig)
-		sc.lastConfigNum++
-
+		sc.applyJoin(op)
 	case LEAVE:
-		// make a new configuration without given replica groups
-		oldGIDs := sc.configs[sc.lastConfigNum].Groups
-		newGIDs := make(map[int][]string)
-		// numGroups := 0
-		newNumGroups := 0
-		// copy old groups (that will not be removed)
-		for gid, servers := range oldGIDs {
-			toBeRemoved := false
-			for _, rGid := range opResult.GIDs {
-				if gid == rGid {
-					toBeRemoved = true
-					break
-				}
-			}
-			if !toBeRemoved && len(servers) > 0 {
-				newGIDs[gid] = servers
-				newNumGroups++
-			}
-		}
-		// divides shards evenly among the remaining groups with as few moves as possible
-		var newShards [NShards]int
-		counts_remaining := make(map[int]int)
-		for i := 0; i < NShards; i++ {
-			currOld := sc.configs[sc.lastConfigNum].Shards[i]
-			kept := true
-			for _, rGid := range opResult.GIDs {
-				if currOld == rGid {
-					kept = false
-					newShards[i] = 0
-					break
-				}
-			}
-			if kept {
-				newShards[i] = currOld
-				counts_remaining[sc.configs[sc.lastConfigNum].Shards[i]]++
-			}
-		}
-		if newNumGroups == 0 {
-			newConfigNum := sc.lastConfigNum + 1
-			newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
-			sc.configs = append(sc.configs, newConfig)
-			sc.lastConfigNum++
-			break
-		}
-		newShardsPerGroup := NShards / newNumGroups
-		for i := 0; i < NShards; i++ {
-			if newShards[i] == 0 {
-				for gid := range newGIDs {
-					if counts_remaining[gid] < newShardsPerGroup {
-						newShards[i] = gid
-						counts_remaining[gid]++
-						break
-					}
-				}
-			}
-		}
-
-		//now assign the new config
-		newConfigNum := sc.lastConfigNum + 1
-		newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
-		sc.configs = append(sc.configs, newConfig)
-		sc.lastConfigNum++
+		sc.applyLeave(op)
 	case MOVE:
-		// make a new configuration with given replica group
-		oldGIDs := sc.configs[sc.lastConfigNum].Groups
-		newGIDs := make(map[int][]string)
-		for gid, servers := range oldGIDs {
-			newGIDs[gid] = servers
-		}
-		var newShards [NShards]int
-		for i := 0; i < NShards; i++ {
-			if i == opResult.Shard {
-				newShards[i] = opResult.GID
-			} else {
-				newShards[i] = sc.configs[sc.lastConfigNum].Shards[i]
-			}
-		}
-		//now assign the new config
-		newConfigNum := sc.lastConfigNum + 1
-		newConfig := Config{Num: newConfigNum, Shards: newShards, Groups: newGIDs}
-		sc.configs = append(sc.configs, newConfig)
-		sc.lastConfigNum++
+		sc.applyMove(op)
 	case QUERY:
-		// no state change for query
+		// no-op
 	}
+}
+
+func (sc *ShardCtrler) applyJoin(op Op) {
+	old := sc.configs[len(sc.configs)-1]
+	newGroups := deepCopyGroups(old.Groups)
+	for gid, servers := range op.Servers {
+		newGroups[gid] = servers
+	}
+	gids := sortedGIDs(newGroups)
+	newConfig := Config{
+		Num:    old.Num + 1,
+		Groups: newGroups,
+		Shards: rebalanceShards(gids),
+	}
+	sc.configs = append(sc.configs, newConfig)
+}
+
+func (sc *ShardCtrler) applyLeave(op Op) {
+	old := sc.configs[len(sc.configs)-1]
+	leaving := make(map[int]bool)
+	for _, gid := range op.GIDs {
+		leaving[gid] = true
+	}
+	newGroups := make(map[int][]string)
+	for gid, servers := range old.Groups {
+		if !leaving[gid] {
+			newGroups[gid] = servers
+		}
+	}
+	gids := sortedGIDs(newGroups)
+	var newShards [NShards]int
+	if len(gids) > 0 {
+		newShards = rebalanceShards(gids)
+	}
+	sc.configs = append(sc.configs, Config{
+		Num:    old.Num + 1,
+		Groups: newGroups,
+		Shards: newShards,
+	})
+}
+
+func (sc *ShardCtrler) applyMove(op Op) {
+	old := sc.configs[len(sc.configs)-1]
+	newShards := old.Shards
+	newShards[op.Shard] = op.GID
+	sc.configs = append(sc.configs, Config{
+		Num:    old.Num + 1,
+		Groups: deepCopyGroups(old.Groups),
+		Shards: newShards,
+	})
+}
+
+// ==============================
+// Helpers
+// ==============================
+
+func rebalanceShards(gids []int) [NShards]int {
+	var shards [NShards]int
+	sort.Ints(gids)
+	perGroup := NShards / len(gids)
+	extra := NShards % len(gids)
+	idx := 0
+	for i, gid := range gids {
+		num := perGroup
+		if i < extra {
+			num++
+		}
+		for j := 0; j < num; j++ {
+			shards[idx] = gid
+			idx++
+		}
+	}
+	return shards
+}
+
+func deepCopyGroups(groups map[int][]string) map[int][]string {
+	copy := make(map[int][]string)
+	for gid, servers := range groups {
+		copy[gid] = append([]string{}, servers...)
+	}
+	return copy
+}
+
+func sortedGIDs(groups map[int][]string) []int {
+	var gids []int
+	for gid := range groups {
+		gids = append(gids, gid)
+	}
+	sort.Ints(gids)
+	return gids
 }
