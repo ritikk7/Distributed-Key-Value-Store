@@ -11,25 +11,60 @@ import (
 	"strconv"
 )
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+type Job struct {
+	Type              int
+	WorkerNumber      int
+	InputFile         string
+	IntermediateFiles []string
+	ShouldQuit        bool
 }
 
-type ExampleReply struct {
-	Y int
+type MapJob struct {
+	InputFile    string
+	MapJobNumber int
+	ReducerCount int
+}
+
+type ReduceJob struct {
+	IntermediateFiles []string
+	ReduceNumber      int
+}
+
+type RequestTaskArgs struct {
+	Pid int
+}
+
+type RequestTaskReply struct {
+	MapJob    *MapJob
+	ReduceJob *ReduceJob
+	Done      bool
+}
+
+type ReportMapTaskArgs struct {
+	InputFile        string
+	IntermediateFile []string
+	Pid              int
+}
+
+type ReportMapTaskReply struct {
+}
+
+type ReportReduceTaskArgs struct {
+	Pid          int
+	ReduceNumber int
+}
+
+type ReportReduceTaskReply struct {
 }
 
 // Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
+// Can't use the current directory since
+// Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
-	s := "/var/tmp/5840-mr-"
+	s := "/var/tmp/824-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
